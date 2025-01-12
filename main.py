@@ -12,19 +12,23 @@ import numpy as np
 import os
 import shutil
 from collections import Counter
+from tensorflow.keras.utils import Sequence
 
 
-class RGBADataGenerator:
+class RGBADataGenerator(Sequence):
     def __init__(self, generator):
         self.generator = generator
         self.classes = generator.classes
         self.class_indices = generator.class_indices
         self.filenames = generator.filenames
 
-    def __iter__(self):
-        for images, labels in self.generator:
-            images = np.array([self.preprocess_image(image) for image in images])
-            yield images, labels
+    def __len__(self):
+        return len(self.generator)
+
+    def __getitem__(self, index):
+        images, labels = self.generator[index]
+        images = np.array([self.preprocess_image(image) for image in images])
+        return images, labels
 
     def preprocess_image(self, image):
         image = Image.fromarray((image * 255).astype(np.uint8))  # Convert to PIL
@@ -32,9 +36,26 @@ class RGBADataGenerator:
             image = image.convert('RGBA')
         return np.array(image) / 255.0
 
-    def reset(self):
-        if hasattr(self.generator, 'reset'):
-            self.generator.reset()
+    def on_epoch_end(self):
+        if hasattr(self.generator, 'on_epoch_end'):
+            self.generator.on_epoch_end()
+
+
+def relabel_classes(generator):
+    class_mapping = {
+        '0': 0,
+        '1': 1,
+        '2': 2,
+        '3': 3,
+        '4': 4
+    }
+
+    class_names = ['Normal', 'Mild', 'Moderate', 'Severe', 'Proliferative']
+
+    generator.class_indices = {str(i): class_names[i] for i in range(5)}
+    generator.classes = np.array([class_mapping[os.path.basename(os.path.dirname(file_name))] for file_name in generator.filenames])
+
+    return generator
 
 
 train_dir = 'dataset/oversampled_train'
