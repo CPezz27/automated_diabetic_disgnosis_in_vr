@@ -8,8 +8,7 @@ train_dir = 'dataset/oversampled_train'
 
 
 def oversample_dataset(source_dir, output_dir, target_count_per_class):
-    if os.path.exists(output_dir):
-        shutil.rmtree(output_dir)
+
     os.makedirs(output_dir, exist_ok=True)
 
     datagen = ImageDataGenerator(
@@ -30,17 +29,26 @@ def oversample_dataset(source_dir, output_dir, target_count_per_class):
         os.makedirs(output_class_dir, exist_ok=True)
 
         if os.path.isdir(class_dir):
-            images = [os.path.join(class_dir, img) for img in os.listdir(class_dir) if
-                      img.lower().endswith(('png', 'jpg', 'jpeg'))]
-            class_count = len(images)
 
-            for img_path in images:
-                shutil.copy(img_path, output_class_dir)
+            existing_images = [img for img in os.listdir(output_class_dir) if img.lower().endswith(('png', 'jpg', 'jpeg'))]
+            class_count = len(existing_images)
 
-            while class_count < target_count_per_class:
-                for img_path in images:
-                    if class_count >= target_count_per_class:
-                        break
+            if class_count == 0:
+                original_images = [os.path.join(class_dir, img) for img in os.listdir(class_dir) if
+                                   img.lower().endswith(('png', 'jpg', 'jpeg'))]
+                for img_path in original_images:
+                    shutil.copy(img_path, output_class_dir)
+                class_count += len(original_images)
+
+            if class_count < target_count_per_class:
+                print(f"Augmenting class '{class_name}' from {class_count} to {target_count_per_class} images...")
+                images = [os.path.join(output_class_dir, img) for img in os.listdir(output_class_dir) if
+                          img.lower().endswith(('png', 'jpg', 'jpeg'))]
+
+                while class_count < target_count_per_class:
+                    for img_path in images:
+                        if class_count >= target_count_per_class:
+                            break
 
                     with Image.open(img_path) as img:
                         if img.mode != 'RGBA':
@@ -55,9 +63,11 @@ def oversample_dataset(source_dir, output_dir, target_count_per_class):
 
     print(f"Oversampling completed in {output_dir}")
     for class_name in os.listdir(output_dir):
-        print(f"{class_name}: {len(os.listdir(os.path.join(output_dir, class_name)))} images")
+        class_path = os.path.join(output_dir, class_name)
+        if os.path.isdir(class_path):
+            print(f"{class_name}: {len(os.listdir(class_path))} images")
 
 
-target_count = 55000
+target_count = 55500
 oversampled_train_dir = "dataset/oversampled_train"
 oversample_dataset(train_dir, oversampled_train_dir, target_count)
