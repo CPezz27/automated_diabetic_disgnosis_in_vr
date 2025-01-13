@@ -1,20 +1,10 @@
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, GlobalAveragePooling2D, BatchNormalization
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.regularizers import l2
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, LearningRateScheduler
-from sklearn.metrics import classification_report, confusion_matrix
-import matplotlib.pyplot as plt
-import seaborn as sns
 from PIL import Image
 import numpy as np
 import os
 import shutil
-from collections import Counter
 
 train_dir = 'dataset/oversampled_train'
-test_dir = 'dataset/standardize_dataset/test'
 
 
 def oversample_dataset(source_dir, output_dir, target_count_per_class):
