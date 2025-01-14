@@ -3,6 +3,8 @@ from PIL import Image
 import numpy as np
 import os
 import shutil
+import random
+import time
 
 train_dir = 'dataset/oversampled_train'
 
@@ -45,6 +47,8 @@ def oversample_dataset(source_dir, output_dir, target_count_per_class):
                 images = [os.path.join(output_class_dir, img) for img in os.listdir(output_class_dir) if
                           img.lower().endswith(('png', 'jpg', 'jpeg'))]
 
+                random.shuffle(images)
+
                 while class_count < target_count_per_class:
                     for img_path in images:
                         if class_count >= target_count_per_class:
@@ -55,9 +59,14 @@ def oversample_dataset(source_dir, output_dir, target_count_per_class):
                             img = img.convert('RGBA')
                         img_array = np.expand_dims(np.array(img), axis=0)
 
-                    for batch in datagen.flow(img_array, batch_size=32, save_to_dir=output_class_dir,
-                                              save_prefix='aug', save_format='png'):
-                        class_count += len(batch)
+                    unique_prefix = f"aug_{int(time.time())}"
+
+                    print(f"Starting augmentation for class '{class_name}', currently at {class_count}/{target_count_per_class} images.")
+
+                    for batch in datagen.flow(img_array, batch_size=1, save_to_dir=output_class_dir,
+                                              save_prefix=unique_prefix, save_format='png'):
+                        class_count += 1
+                        print(f"Generated {class_count}/{target_count_per_class} images for class '{class_name}'")
                         if class_count >= target_count_per_class:
                             break
 
