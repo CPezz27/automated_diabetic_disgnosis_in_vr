@@ -47,9 +47,10 @@ def oversample_dataset(source_dir, output_dir, target_count_per_class):
                 images = [os.path.join(output_class_dir, img) for img in os.listdir(output_class_dir) if
                           img.lower().endswith(('png', 'jpg', 'jpeg'))]
 
-                random.shuffle(images)
-
                 while class_count < target_count_per_class:
+                    
+                    random.shuffle(images)
+
                     for img_path in images:
                         if class_count >= target_count_per_class:
                             break

@@ -4,8 +4,8 @@ import numpy as np
 from PIL import Image, ImageEnhance
 from rembg import remove
 
-input_base_dir = 'dataset/augmented_resized_V2'
-output_base_dir = 'dataset/standardize_dataset'
+input_base_dir = 'dataset/oversampled_train'
+output_base_dir = 'dataset/oversampled_train'
 
 
 def remove_background(image):
@@ -37,8 +37,16 @@ def standardize_brightness(image, target_brightness=8):
     return enhancer.enhance(brightness_factor)
 
 
+def resize_image(image, size=(256, 256)):
+    try:
+        return image.resize(size, Image.LANCZOS)
+    except AttributeError:
+        return image.resize(size, Image.ANTIALIAS)
+
+
 def preprocess_full_pipeline(img):
 
+    img = resize_image(img)
     img = remove_background(img)
     img = standardize_brightness(img)
 
