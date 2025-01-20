@@ -37,7 +37,7 @@ def standardize_brightness(image, target_brightness=8):
     return enhancer.enhance(brightness_factor)
 
 
-def resize_image(image, size=(256, 256)):
+def resize_image(image, size=(128, 128)):
     try:
         return image.resize(size, Image.LANCZOS)
     except AttributeError:

@@ -5,14 +5,12 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 import tensorflow.keras.backend as K
-from tensorflow.keras.losses import MeanSquaredError
-import os
-from tensorflow.keras.utils import Sequence
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
 
 
 model = load_model('retinal_cnn_model.keras')
 print("Modello caricato correttamente!")
+
+class_names = {0: "Normal", 1: "Mild", 2: "Moderate", 3: "Severe", 4: "Proliferative"}
 
 
 def grad_cam(model, image, class_index, layer_name="conv2d_2"):
@@ -42,34 +40,23 @@ def overlay_grad_cam(heatmap, original_image, alpha=0.4):
     heatmap = cv2.resize(heatmap, (original_image.shape[1], original_image.shape[0]))
     heatmap = np.uint8(255 * heatmap)
     heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+
+    if original_image.shape[-1] == 4:
+        alpha_channel = np.ones_like(heatmap_color[..., 0]) * 255
+        heatmap_color = np.dstack([heatmap_color, alpha_channel])
+    elif original_image.shape[-1] == 3 and heatmap_color.shape[-1] == 4:
+        heatmap_color = heatmap[..., :3]
+
     overlay = cv2.addWeighted(original_image, 1 - alpha, heatmap_color, alpha, 0)
     return overlay
 
 
-class LesionGuidedLoss(tf.keras.losses.Loss):
-    def __init__(self, weight=0.5):
-        super(LesionGuidedLoss, self).__init__()
-        self.weight = weight
-        self.mse = MeanSquaredError()
-
-    def call(self, y_true, y_pred):
-        lesion_mask = y_true[..., -1]
-        predictions = y_pred[..., :-1]  
-
-        classification_loss = tf.keras.losses.categorical_crossentropy(
-            y_true[..., :-1], predictions
-        )
-        localization_loss = self.mse(lesion_mask, predictions)
-
-        return classification_loss + self.weight * localization_loss
-
-
-test_dir = 'dataset/augmented_resized_V2/test'  
+test_dir = 'dataset/augmented_resized_V2/test'
 test_datagen = ImageDataGenerator(rescale=1.0 / 255.0)
 
 test_batches = test_datagen.flow_from_directory(
     test_dir,
-    target_size=(224, 224),
+    target_size=(128, 128),
     batch_size=32,
     class_mode='categorical',
     shuffle=True
@@ -80,12 +67,17 @@ random_index = np.random.randint(0, len(image_batch))
 image = image_batch[random_index]
 label = label_batch[random_index]
 
+image = np.concatenate([image, np.ones((*image.shape[:2], 1))], axis=-1)
+
 predictions = model.predict(np.expand_dims(image, axis=0))
 predicted_class = np.argmax(predictions[0])
-predicted_probability = predictions[0][predicted_class]
-print(f"Predicted class: {predicted_class}, Probability: {predicted_probability}")
+predicted_probability = predictions[0][predicted_class]*100
+predicted_label = class_names[predicted_class]
+print(f"Predicted class: {predicted_class}, Probability: {predicted_probability:.2f}%")
+
 heatmap = grad_cam(model, image, predicted_class, layer_name="conv2d_1")
 original_image = (image * 255).astype(np.uint8)
+
 overlay = overlay_grad_cam(heatmap, original_image)
 
 plt.figure(figsize=(15, 5))
@@ -94,17 +86,17 @@ plt.imshow(original_image)
 plt.title("Original image")
 plt.axis("off")
 
-
 plt.subplot(1, 3, 2)
-plt.imshow(overlay)
-plt.title("Grad-CAM Overlay")
+plt.imshow(heatmap, cmap='jet')
+plt.colorbar()
+plt.title("Heatmap")
 plt.axis("off")
 
-if 'lesion_mask' in locals():
-    plt.subplot(1, 3, 3)
-    plt.imshow(lesion_mask, cmap='gray')
-    plt.title("Annotated Lesion")
-    plt.axis("off")
 
+plt.subplot(1, 3, 3)
+plt.imshow(overlay)
+plt.title(f"Grad-CAM Overlay\nPredicted: {predicted_label}")
+plt.axis("off")
 
+plt.tight_layout()
 plt.show()

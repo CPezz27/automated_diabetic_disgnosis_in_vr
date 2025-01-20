@@ -10,8 +10,6 @@ import seaborn as sns
 from PIL import Image
 import numpy as np
 import os
-import shutil
-from collections import Counter
 from tensorflow.keras.utils import Sequence
 
 
@@ -40,6 +38,10 @@ class RGBADataGenerator(Sequence):
         if hasattr(self.generator, 'on_epoch_end'):
             self.generator.on_epoch_end()
 
+    def reset(self):
+        if hasattr(self.generator, 'reset'):
+            self.generator.reset()
+
 
 def relabel_classes(generator):
     class_mapping = {
@@ -63,11 +65,11 @@ test_dir = 'dataset/standardize_dataset/test'
 
 train_datagen = ImageDataGenerator(
     rescale=1. / 255,
-    rotation_range=30,
-    width_shift_range=0.2,
-    height_shift_range=0.2,
-    shear_range=0.2,
-    zoom_range=0.2,
+    rotation_range=45,
+    width_shift_range=0.3,
+    height_shift_range=0.3,
+    shear_range=0.3,
+    zoom_range=0.3,
     horizontal_flip=True,
     vertical_flip=True,
     fill_mode="nearest"
@@ -77,16 +79,16 @@ test_datagen = ImageDataGenerator(rescale=1. / 255)
 
 train_batches = train_datagen.flow_from_directory(
     train_dir,
-    target_size=(224, 224),
-    batch_size=16,
+    target_size=(128, 128),
+    batch_size=32,
     class_mode='categorical',
     shuffle=True
 )
 
 test_batches = test_datagen.flow_from_directory(
     test_dir,
-    target_size=(224, 224),
-    batch_size=16,
+    target_size=(128, 128),
+    batch_size=32,
     class_mode='categorical',
     shuffle=False
 )
@@ -95,7 +97,11 @@ train_batches = RGBADataGenerator(train_batches)
 test_batches = RGBADataGenerator(test_batches)
 
 model = Sequential([
-    Conv2D(64, (3, 3), activation='relu', kernel_regularizer=l2(0.001), input_shape=(224, 224, 4)),
+    Conv2D(32, (3, 3), activation='relu', kernel_regularizer=l2(0.001), input_shape=(128, 128, 4)),
+    BatchNormalization(),
+    MaxPooling2D(pool_size=(2, 2)),
+
+    Conv2D(64, (3, 3), activation='relu', kernel_regularizer=l2(0.001)),
     BatchNormalization(),
     MaxPooling2D(pool_size=(2, 2)),
 
@@ -103,17 +109,13 @@ model = Sequential([
     BatchNormalization(),
     MaxPooling2D(pool_size=(2, 2)),
 
-    Conv2D(256, (3, 3), activation='relu', kernel_regularizer=l2(0.001)),
-    BatchNormalization(),
-    MaxPooling2D(pool_size=(2, 2)),
-
     GlobalAveragePooling2D(),
     Dense(128, activation='relu'),
-    Dropout(0.5),
+    Dropout(0.7),
     Dense(5, activation='softmax')
 ])
 
-optimizer = Adam(learning_rate=0.0001)
+optimizer = Adam(learning_rate=0.001)
 model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
 
 early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
@@ -131,7 +133,8 @@ history = model.fit(
     validation_data=test_batches,
     epochs=10,
     callbacks=[early_stopping, lr_warmup, lr_scheduler],
-    verbose=1
+    verbose=1,
+    workers=8
 )
 
 model.save('retinal_cnn_model.keras')
