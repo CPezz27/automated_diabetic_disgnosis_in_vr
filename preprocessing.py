@@ -1,13 +1,12 @@
 import os
-import io
 import numpy as np
-from PIL import Image, ImageEnhance
-from rembg import remove
+from PIL import Image
+import cv2
 
 input_base_dir = 'dataset/oversampled_train'
 output_base_dir = 'dataset/oversampled_train'
 
-
+'''
 def remove_background(image):
 
     if isinstance(image, np.ndarray):
@@ -21,20 +20,31 @@ def remove_background(image):
     img_without_bg = img_without_bg.convert("RGBA")
 
     return img_without_bg
+'''
 
 
-def standardize_brightness(image, target_brightness=8):
+def crop_to_content(image):
 
-    img = image.convert('RGBA')
-    img_array = np.array(img)
-    brightness = np.mean(np.sqrt(
-        0.241 * img_array[:, :, 0]**2 +
-        0.691 * img_array[:, :, 1]**2 +
-        0.068 * img_array[:, :, 2]**2
-    ))
-    brightness_factor = target_brightness / brightness
-    enhancer = ImageEnhance.Brightness(img)
-    return enhancer.enhance(brightness_factor)
+    img_gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGBA2GRAY)
+    _, thresh = cv2.threshold(img_gray, 10, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if contours:
+        x, y, w, h = cv2.boundingRect(contours[0])
+        cropped_image = image.crop((x, y, x + w, y + h))
+        return cropped_image
+    else:
+        return image
+
+
+def standardize_brightness_clahe(image):
+    img_lab = cv2.cvtColor(np.array(image.convert('RGB')), cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(img_lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    img_lab = cv2.merge((l, a, b))
+    img_clahe = cv2.cvtColor(img_lab, cv2.COLOR_LAB2RGB)
+    return Image.fromarray(img_clahe)
 
 
 def resize_image(image, size=(128, 128)):
@@ -47,8 +57,8 @@ def resize_image(image, size=(128, 128)):
 def preprocess_full_pipeline(img):
 
     img = resize_image(img)
-    img = remove_background(img)
-    img = standardize_brightness(img)
+    img = crop_to_content(img)
+    img = standardize_brightness_clahe(img)
 
     return img
 

@@ -4,21 +4,37 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, LearningRateScheduler
+from tensorflow.keras.utils import Sequence
+from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import classification_report, confusion_matrix
+from albumentations import Compose, RandomCrop, HorizontalFlip, VerticalFlip, ElasticTransform, CoarseDropout, Normalize
+from albumentations.pytorch import ToTensorV2
 import matplotlib.pyplot as plt
 import seaborn as sns
 from PIL import Image
 import numpy as np
 import os
-from tensorflow.keras.utils import Sequence
+
+
+def get_augmentation():
+    return Compose([
+        RandomCrop(width=112, height=112),
+        HorizontalFlip(p=0.5),
+        VerticalFlip(p=0.5),
+        ElasticTransform(p=0.5, sigma=10, alpha=1),
+        CoarseDropout(p=0.2),
+        Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5), p=1),
+        ToTensorV2()
+    ])
 
 
 class RGBADataGenerator(Sequence):
-    def __init__(self, generator):
+    def __init__(self, generator, augmentations=None):
         self.generator = generator
         self.classes = generator.classes
         self.class_indices = generator.class_indices
         self.filenames = generator.filenames
+        self.augmentations = augmentations
 
     def __len__(self):
         return len(self.generator)
@@ -26,6 +42,9 @@ class RGBADataGenerator(Sequence):
     def __getitem__(self, index):
         images, labels = self.generator[index]
         images = np.array([self.preprocess_image(image) for image in images])
+        if self.augmentations:
+            images = np.array(
+                [self.augmentations(image=image)['image'] for image in images])  # Applica le trasformazioni
         return images, labels
 
     def preprocess_image(self, image):
@@ -63,8 +82,8 @@ def relabel_classes(generator):
 train_dir = 'dataset/oversampled_train'
 test_dir = 'dataset/standardize_dataset/test'
 
-train_datagen = ImageDataGenerator(
-    rescale=1. / 255,
+train_datagen = ImageDataGenerator(rescale=1. / 255)
+'''
     rotation_range=45,
     width_shift_range=0.3,
     height_shift_range=0.3,
@@ -73,7 +92,9 @@ train_datagen = ImageDataGenerator(
     horizontal_flip=True,
     vertical_flip=True,
     fill_mode="nearest"
-)
+'''
+
+augmentation_pipeline = get_augmentation()
 
 test_datagen = ImageDataGenerator(rescale=1. / 255)
 
@@ -93,7 +114,7 @@ test_batches = test_datagen.flow_from_directory(
     shuffle=False
 )
 
-train_batches = RGBADataGenerator(train_batches)
+train_batches = RGBADataGenerator(train_batches, augmentations=augmentation_pipeline)
 test_batches = RGBADataGenerator(test_batches)
 
 model = Sequential([
@@ -128,13 +149,26 @@ def warmup_scheduler(epoch, lr):
 lr_warmup = LearningRateScheduler(warmup_scheduler)
 lr_scheduler = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
 
+
+def calculate_class_weights(generator):
+    class_weights = compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(generator.classes),
+        y=generator.classes
+    )
+    return dict(zip(np.unique(generator.classes), class_weights))
+
+
+class_weights = calculate_class_weights(train_batches)
+
 history = model.fit(
     train_batches,
     validation_data=test_batches,
     epochs=10,
     callbacks=[early_stopping, lr_warmup, lr_scheduler],
     verbose=1,
-    workers=8
+    workers=8,
+    class_weight=class_weights
 )
 
 model.save('retinal_cnn_model.keras')
