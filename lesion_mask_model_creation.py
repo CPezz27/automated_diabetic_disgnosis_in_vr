@@ -6,9 +6,13 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
-image_dir = 'dataset/IDRiD/images'
-mask_dir = 'dataset/IDRiD/masks'
+image_dir = 'dataset/IDRiD/train/images'
+mask_dir = 'dataset/IDRiD/train/masks'
+
+test_image_dir = 'dataset/IDRiD/test/images'
+test_mask_dir = 'dataset/IDRiD/test/masks'
 
 
 def preprocess_data(image_dir, mask_dir, lesion_types=["MA", "HE", "EX", "SE", "OD"], target_size=(128, 128)):
@@ -41,7 +45,9 @@ def preprocess_data(image_dir, mask_dir, lesion_types=["MA", "HE", "EX", "SE", "
         images.append(img)
         masks.append(combined_mask)
 
-    return np.array(images), np.array(masks)
+    test_images = np.array(images)
+    test_masks = np.expand_dims(np.array(masks), axis=-1)
+    return test_images, test_masks
 
 
 def unet(input_size=(128, 128, 3)):
@@ -82,6 +88,36 @@ images, masks = preprocess_data(image_dir, mask_dir)
 
 x_train, x_val, y_train, y_val = train_test_split(images, masks, test_size=0.2, random_state=42)
 
+x_test, y_test = preprocess_data(test_image_dir, test_mask_dir)
+
+image_datagen = ImageDataGenerator(
+    rotation_range=20,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    fill_mode='nearest'
+)
+
+mask_datagen = ImageDataGenerator(
+    rotation_range=20,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    fill_mode='nearest'
+)
+
+seed = 42
+image_generator = image_datagen.flow(
+    x_train, batch_size=16, seed=seed
+)
+mask_generator = mask_datagen.flow(
+    y_train, batch_size=16, seed=seed
+)
+
+train_generator = zip(image_generator, mask_generator)
+
 early_stopping = EarlyStopping(
     monitor='val_accuracy',
     patience=10,
@@ -89,7 +125,8 @@ early_stopping = EarlyStopping(
 )
 
 history = model.fit(
-    x_train, y_train,
+    train_generator,
+    steps_per_epoch=len(x_train),
     validation_data=(x_val, y_val),
     epochs=25,
     batch_size=1,
@@ -98,14 +135,35 @@ history = model.fit(
 
 model.save('lesion_mask_model.keras')
 
+test_loss, test_accuracy = model.evaluate(x_test, y_test)
+print(f"Test Loss: {test_loss}, Test Accuracy: {test_accuracy}")
 
-index = 0
+random_index = np.random.randint(0, len(images))
 plt.figure(figsize=(10, 5))
 plt.subplot(1, 2, 1)
-plt.imshow(images[index])
+plt.imshow(images[random_index])
 plt.title("Image")
 plt.subplot(1, 2, 2)
-plt.imshow(masks[index], cmap='gray')
+plt.imshow(masks[random_index], cmap='gray')
 plt.title("Mask")
 plt.show()
 
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.plot(history.history['accuracy'], label='Train Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.title('Model Accuracy')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Model Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.show()
