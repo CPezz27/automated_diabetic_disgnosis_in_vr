@@ -61,11 +61,9 @@ def unet(input_size=(128, 128, 3)):
     conv2 = Conv2D(128, 3, activation='relu', padding='same')(conv2)
     pool2 = MaxPooling2D(pool_size=(2, 2))(conv2)
 
-    # Bottleneck
     conv3 = Conv2D(256, 3, activation='relu', padding='same')(pool2)
     conv3 = Conv2D(256, 3, activation='relu', padding='same')(conv3)
 
-    # Decoder
     up1 = UpSampling2D(size=(2, 2))(conv3)
     merge1 = concatenate([conv2, up1], axis=3)
     conv4 = Conv2D(128, 3, activation='relu', padding='same')(merge1)

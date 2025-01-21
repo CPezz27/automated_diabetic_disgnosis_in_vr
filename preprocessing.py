@@ -6,22 +6,6 @@ import cv2
 input_base_dir = 'dataset/oversampled_train'
 output_base_dir = 'dataset/oversampled_train'
 
-'''
-def remove_background(image):
-
-    if isinstance(image, np.ndarray):
-        image = Image.fromarray(np.uint8(image * 255))
-
-    img_byte_arr = io.BytesIO()
-    image.save(img_byte_arr, format='PNG')
-    img_byte_arr = img_byte_arr.getvalue()
-    output = remove(img_byte_arr)
-    img_without_bg = Image.open(io.BytesIO(output))
-    img_without_bg = img_without_bg.convert("RGBA")
-
-    return img_without_bg
-'''
-
 
 def crop_to_content(image):
 
