@@ -23,7 +23,21 @@ def extract_lesion_mask(image, model, target_size=(128, 128)):
 
     print(f"Predicted mask min: {predicted_mask.min()}, max: {predicted_mask.max()}")
 
-    binary_mask = (predicted_mask > 0.3).astype(np.uint8) * 255
+    plt.imshow(predicted_mask, cmap='viridis')
+    plt.colorbar()
+    plt.title("Predicted Mask (Probability Map)")
+    plt.show()
+
+    # Controlla i valori della maschera
+    print("Unique values in mask:", np.unique(predicted_mask))
+
+    binary_mask = (predicted_mask > 0.007).astype(np.uint8) * 255
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask)
+    filtered_mask = np.zeros_like(binary_mask)
+
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] > 50:
+            filtered_mask[labels == i] = 255
 
     return Image.fromarray(binary_mask.squeeze())
 
