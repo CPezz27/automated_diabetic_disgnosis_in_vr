@@ -6,6 +6,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
+from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
 image_dir = 'dataset/IDRiD/train/images'
@@ -20,8 +21,7 @@ def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
     masks = []
     for filename in os.listdir(image_dir):
         img_path = os.path.join(image_dir, filename)
-
-        combined_mask = None
+        mask_stack = []
 
         for lesion_type in lesion_types:
             mask_filename = filename.replace(".jpg", f"_{lesion_type}.tif")
@@ -30,27 +30,53 @@ def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
             if os.path.exists(mask_path):
                 mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
                 mask = cv2.resize(mask, target_size) / 255.0
-                if combined_mask is None:
-                    combined_mask = mask
-                else:
-                    combined_mask = np.maximum(combined_mask, mask)
+            else:
+                mask = np.zeros(target_size)
 
-        if combined_mask is None:
+            mask_stack.append(mask)
+
+        if not mask_stack:
             print(f"Warning: No masks found for {filename}")
             continue
 
+        mask_stack = np.stack(mask_stack, axis=-1)
+        mask_stack = np.argmax(mask_stack, axis=-1)
+        mask_stack = to_categorical(mask_stack, num_classes=len(lesion_types))
+        masks.append(mask_stack)
+
         img = cv2.imread(img_path)
         img = cv2.resize(img, target_size) / 255.0
-
         images.append(img)
-        masks.append(combined_mask)
 
     test_images = np.array(images)
-    test_masks = np.expand_dims(np.array(masks), axis=-1)
+    test_masks = np.array(masks)
+
     return test_images, test_masks
 
 
-def unet(input_size=(128, 128, 3)):
+def visualize_predictions(model, images, masks, lesion_types):
+    predictions = model.predict(images)
+
+    for i in range(5):
+        plt.figure(figsize=(12, 6))
+
+        plt.subplot(1, len(lesion_types) + 2, 1)
+        plt.imshow(images[i])
+        plt.title("Input Image")
+
+        plt.subplot(1, len(lesion_types) + 2, 2)
+        plt.imshow(np.argmax(masks[i], axis=-1))
+        plt.title("Ground Truth")
+
+        for j, lesion_type in enumerate(lesion_types):
+            plt.subplot(1, len(lesion_types) + 2, 3 + j)
+            plt.imshow(predictions[i, :, :, j], cmap='gray')
+            plt.title(f"Prediction: {lesion_type}")
+
+        plt.show()
+
+
+def unet(input_size=(128, 128, 3), num_classes=4):
     inputs = Input(input_size)
 
     conv1 = Conv2D(64, 3, activation='relu', padding='same')(inputs)
@@ -74,14 +100,14 @@ def unet(input_size=(128, 128, 3)):
     conv5 = Conv2D(64, 3, activation='relu', padding='same')(merge2)
     conv5 = Conv2D(64, 3, activation='relu', padding='same')(conv5)
 
-    output = Conv2D(1, 1, activation='sigmoid')(conv5)
+    output = Conv2D(num_classes, 1, activation='softmax')(conv5)
 
     return Model(inputs, output)
 
 
 lesion_mask = unet()
 lesion_mask_types = ["EX", "MA", "HE", "SE"]
-lesion_mask.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+lesion_mask.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 
 images, masks = preprocess_data(image_dir, mask_dir, lesion_mask_types)
 
@@ -137,7 +163,7 @@ print("Il modello lesion_mask è stato salvato correttamente!")
 
 
 optic_disc = unet()
-optic_disc.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+optic_disc.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 
 optic_disc_type = ["OD"]
 
@@ -195,6 +221,12 @@ print("Il modello per optic disc è stato salvato correttamente!")
 
 test_loss, test_accuracy = optic_disc.evaluate(x2_test, y2_test)
 print(f"Test Loss: {test_loss}, Test Accuracy: {test_accuracy}")
+
+
+subset_images = x_test[:5]
+subset_masks = y_test[:5]
+
+visualize_predictions(lesion_mask, subset_images, subset_masks, lesion_mask_types)
 
 plt.subplot(1, 2, 1)
 plt.plot(history.history['accuracy'], label='Train Accuracy')
