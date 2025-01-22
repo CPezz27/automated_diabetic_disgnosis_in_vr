@@ -3,6 +3,7 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from tensorflow.keras.models import load_model
+from tensorflow.keras.utils import to_categorical
 
 image_dir = 'dataset/IDRiD/train/images'
 mask_dir = 'dataset/IDRiD/train/masks'
@@ -13,8 +14,7 @@ def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
     masks = []
     for filename in os.listdir(image_dir):
         img_path = os.path.join(image_dir, filename)
-
-        combined_mask = None
+        mask_stack = []
 
         for lesion_type in lesion_types:
             mask_filename = filename.replace(".jpg", f"_{lesion_type}.tif")
@@ -23,23 +23,27 @@ def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
             if os.path.exists(mask_path):
                 mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
                 mask = cv2.resize(mask, target_size) / 255.0
-                if combined_mask is None:
-                    combined_mask = mask
-                else:
-                    combined_mask = np.maximum(combined_mask, mask)
+            else:
+                mask = np.zeros(target_size)
 
-        if combined_mask is None:
+            mask_stack.append(mask)
+
+        if not mask_stack:
             print(f"Warning: No masks found for {filename}")
             continue
 
+        mask_stack = np.stack(mask_stack, axis=-1)
+        mask_stack = np.argmax(mask_stack, axis=-1)
+        mask_stack = to_categorical(mask_stack, num_classes=len(lesion_types))
+        masks.append(mask_stack)
+
         img = cv2.imread(img_path)
         img = cv2.resize(img, target_size) / 255.0
-
         images.append(img)
-        masks.append(combined_mask)
 
     test_images = np.array(images)
-    test_masks = np.expand_dims(np.array(masks), axis=-1)
+    test_masks = np.array(masks)
+
     return test_images, test_masks
 
 
