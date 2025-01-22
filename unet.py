@@ -1,19 +1,41 @@
 import os
 import numpy as np
 import cv2
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, UpSampling2D, concatenate, Input
-from tensorflow.keras.models import Model
-from tensorflow.keras.callbacks import EarlyStopping
-from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import segmentation_models_pytorch as smp
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
 
-image_dir = 'dataset/IDRiD/train/images'
-mask_dir = 'dataset/IDRiD/train/masks'
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-test_image_dir = 'dataset/IDRiD/test/images'
-test_mask_dir = 'dataset/IDRiD/test/masks'
+
+def tversky_loss(y_true, y_pred, alpha=0.7, beta=0.3, class_weight=None):
+
+    tp = torch.sum(y_true * y_pred, dim=(2, 3))
+    fp = torch.sum((1 - y_true) * y_pred, dim=(2, 3))
+    fn = torch.sum(y_true * (1 - y_pred), dim=(2, 3))
+    tversky = tp / (tp + alpha * fp + beta * fn + 1e-7)
+
+    loss = 1 - tversky
+
+    if class_weight is not None:
+        class_weight = class_weight.view(1, -1)
+        loss *= class_weight
+    return loss.mean()
+
+
+def post_process(mask, threshold=0.5):
+    mask = (mask > threshold).astype(np.uint8)
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
+
+
+def combine_image_with_mask(image, mask):
+    return np.concatenate([image, mask], axis=-1)
 
 
 def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
@@ -48,200 +70,132 @@ def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
         img = cv2.resize(img, target_size) / 255.0
         images.append(img)
 
-    test_images = np.array(images)
-    test_masks = np.array(masks)
-
-    return test_images, test_masks
+    return np.array(images), np.array(masks)
 
 
-def visualize_predictions(model, images, masks, lesion_types):
-    predictions = model.predict(images)
+class CustomDataset(Dataset):
+    def __init__(self, images, masks):
+        self.images = images
+        self.masks = masks
 
-    for i in range(5):
-        plt.figure(figsize=(12, 6))
+    def __len__(self):
+        return len(self.images)
 
-        plt.subplot(1, len(lesion_types) + 2, 1)
-        plt.imshow(images[i])
-        plt.title("Input Image")
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        mask = self.masks[idx]
 
-        plt.subplot(1, len(lesion_types) + 2, 2)
-        plt.imshow(np.argmax(masks[i], axis=-1))
-        plt.title("Ground Truth")
-
-        for j, lesion_type in enumerate(lesion_types):
-            plt.subplot(1, len(lesion_types) + 2, 3 + j)
-            plt.imshow(predictions[i, :, :, j], cmap='gray')
-            plt.title(f"Prediction: {lesion_type}")
-
-        plt.show()
+        image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
+        mask = torch.tensor(mask, dtype=torch.float32).permute(2, 0, 1)
+        return image, mask
 
 
-def unet(input_size=(128, 128, 3), num_classes=4):
-    inputs = Input(input_size)
+image_dir = 'dataset/IDRiD/train/images'
+mask_dir = 'dataset/IDRiD/train/masks'
 
-    conv1 = Conv2D(64, 3, activation='relu', padding='same')(inputs)
-    conv1 = Conv2D(64, 3, activation='relu', padding='same')(conv1)
-    pool1 = MaxPooling2D(pool_size=(2, 2))(conv1)
-
-    conv2 = Conv2D(128, 3, activation='relu', padding='same')(pool1)
-    conv2 = Conv2D(128, 3, activation='relu', padding='same')(conv2)
-    pool2 = MaxPooling2D(pool_size=(2, 2))(conv2)
-
-    conv3 = Conv2D(256, 3, activation='relu', padding='same')(pool2)
-    conv3 = Conv2D(256, 3, activation='relu', padding='same')(conv3)
-
-    up1 = UpSampling2D(size=(2, 2))(conv3)
-    merge1 = concatenate([conv2, up1], axis=3)
-    conv4 = Conv2D(128, 3, activation='relu', padding='same')(merge1)
-    conv4 = Conv2D(128, 3, activation='relu', padding='same')(conv4)
-
-    up2 = UpSampling2D(size=(2, 2))(conv4)
-    merge2 = concatenate([conv1, up2], axis=3)
-    conv5 = Conv2D(64, 3, activation='relu', padding='same')(merge2)
-    conv5 = Conv2D(64, 3, activation='relu', padding='same')(conv5)
-
-    output = Conv2D(num_classes, 1, activation='softmax')(conv5)
-
-    return Model(inputs, output)
-
-
-lesion_mask = unet()
 lesion_mask_types = ["EX", "MA", "HE", "SE"]
-lesion_mask.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-
-images, masks = preprocess_data(image_dir, mask_dir, lesion_mask_types)
-
-x_train, x_val, y_train, y_val = train_test_split(images, masks, test_size=0.2, random_state=42)
-
-x_test, y_test = preprocess_data(test_image_dir, test_mask_dir, lesion_mask_types)
-
-image_datagen = ImageDataGenerator(
-    rotation_range=20,
-    width_shift_range=0.1,
-    height_shift_range=0.1,
-    zoom_range=0.2,
-    horizontal_flip=True,
-    fill_mode='nearest'
-)
-
-mask_datagen = ImageDataGenerator(
-    rotation_range=20,
-    width_shift_range=0.1,
-    height_shift_range=0.1,
-    zoom_range=0.2,
-    horizontal_flip=True,
-    fill_mode='nearest'
-)
-
-seed = 42
-image_generator = image_datagen.flow(
-    x_train, batch_size=16, seed=seed
-)
-mask_generator = mask_datagen.flow(
-    y_train, batch_size=16, seed=seed
-)
-
-train_generator = zip(image_generator, mask_generator)
-
-early_stopping = EarlyStopping(
-    monitor='val_accuracy',
-    patience=10,
-    restore_best_weights=True
-)
-
-history = lesion_mask.fit(
-    train_generator,
-    steps_per_epoch=len(x_train),
-    validation_data=(x_val, y_val),
-    epochs=25,
-    batch_size=8,
-    callbacks=[early_stopping]
-)
-
-lesion_mask.save('lesion_mask_model.keras')
-print("Il modello lesion_mask è stato salvato correttamente!")
-
-
-optic_disc = unet()
-optic_disc.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-
 optic_disc_type = ["OD"]
 
-images, masks_OD = preprocess_data(image_dir, mask_dir, optic_disc_type)
+images, masks = preprocess_data(image_dir, mask_dir, lesion_mask_types)
+images_OD, masks_OD = preprocess_data(image_dir, mask_dir, optic_disc_type)
 
-x2_train, x2_val, y2_train, y2_val = train_test_split(images, masks_OD, test_size=0.2, random_state=42)
+train_lesion_dataset = CustomDataset(images, masks)
+train_lesion_loader = DataLoader(train_lesion_dataset, batch_size=8, shuffle=True)
 
-x2_test, y2_test = preprocess_data(test_image_dir, test_mask_dir, optic_disc_type)
+train_optic_dataset = CustomDataset(images_OD, masks_OD)
+train_optic_loader = DataLoader(train_lesion_dataset, batch_size=8, shuffle=True)
 
-image_datagen = ImageDataGenerator(
-    rotation_range=20,
-    width_shift_range=0.1,
-    height_shift_range=0.1,
-    zoom_range=0.2,
-    horizontal_flip=True,
-    fill_mode='nearest'
-)
+lesion_model = smp.DeepLabV3Plus(
+    encoder_name='resnet34',
+    encoder_weights='imagenet',
+    in_channels=3,
+    classes=len(lesion_mask_types),
+    activation='softmax'
+).to(device)
 
-mask_datagen = ImageDataGenerator(
-    rotation_range=20,
-    width_shift_range=0.1,
-    height_shift_range=0.1,
-    zoom_range=0.2,
-    horizontal_flip=True,
-    fill_mode='nearest'
-)
+optic_disc_model = smp.DeepLabV3Plus(
+    encoder_name='resnet34',
+    encoder_weights='imagenet',
+    in_channels=3,
+    classes=1,
+    activation='sigmoid'
+).to(device)
 
-seed = 42
-image_generator = image_datagen.flow(
-    x2_train, batch_size=16, seed=seed
-)
-mask_generator = mask_datagen.flow(
-    y2_train, batch_size=16, seed=seed
-)
+class_weight = torch.tensor([0.2, 0.3, 0.3, 0.2], device=device)
+loss_fn_lesion = smp.losses.DiceLoss(mode="multiclass")
+optimizer_lesion = optim.Adam(lesion_model.parameters(), lr=1e-3)
 
-train_generator = zip(image_generator, mask_generator)
+loss_fn_disc = smp.losses.DiceLoss(mode="binary")
+optimizer_optic = optim.Adam(optic_disc_model.parameters(), lr=1e-3)
 
-early_stopping = EarlyStopping(
-    monitor='val_accuracy',
-    patience=10,
-    restore_best_weights=True
-)
+num_epochs = 20
+for epoch in range(num_epochs):
+    lesion_model.train()
+    epoch_loss_lesions = 0
+    for images_batch, masks_batch in train_lesion_loader:
+        images_batch, masks_batch = images_batch.to(device), masks_batch.to(device)
 
-history2 = optic_disc.fit(
-    train_generator,
-    steps_per_epoch=len(x_train),
-    validation_data=(x_val, y_val),
-    epochs=25,
-    batch_size=8,
-    callbacks=[early_stopping]
-)
+        optimizer_lesion.zero_grad()
+        outputs = lesion_model(images_batch)
 
-optic_disc.save('optic_disc_model.keras')
-print("Il modello per optic disc è stato salvato correttamente!")
+        loss = tversky_loss(outputs, masks_batch, class_weight=class_weight)
+        loss.backward()
+        optimizer_lesion.step()
+        epoch_loss_lesions += loss.item()
 
-test_loss, test_accuracy = optic_disc.evaluate(x2_test, y2_test)
-print(f"Test Loss: {test_loss}, Test Accuracy: {test_accuracy}")
+    optic_disc_model.train()
+    epoch_loss_disc = 0
+    for images_batch, masks_batch in train_optic_loader:
+        images_batch, masks_batch = images_batch.to(device), masks_batch.to(device)
+
+        optimizer_optic.zero_grad()
+        outputs = optic_disc_model(images_batch)
+        loss = tversky_loss(outputs, masks_batch)
+        loss.backward()
+        optimizer_optic.step()
+        epoch_loss_disc += loss.item()
+
+    print(f"Epoch [{epoch + 1}/{num_epochs}], Lesion Loss: {epoch_loss_lesions / len(train_lesion_loader):.4f}, "
+          f"Disc Loss: {epoch_loss_disc / len(train_optic_loader):.4f}")
 
 
-subset_images = x_test[:5]
-subset_masks = y_test[:5]
+os.makedirs('saved_models', exist_ok=True)
+torch.save(lesion_model.state_dict(), 'saved_models/lesion_model.pth')
+torch.save(optic_disc_model.state_dict(), 'saved_models/optic_disc_model.pth')
 
-visualize_predictions(lesion_mask, subset_images, subset_masks, lesion_mask_types)
+lesion_model.eval()
+optic_disc_model.eval()
 
-plt.subplot(1, 2, 1)
-plt.plot(history.history['accuracy'], label='Train Accuracy')
-plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
-plt.title('Model Accuracy')
-plt.xlabel('Epochs')
-plt.ylabel('Accuracy')
-plt.legend()
 
-plt.subplot(1, 2, 2)
-plt.plot(history.history['loss'], label='Train Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
-plt.title('Model Loss')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.legend()
+random_index = np.random.randint(0, len(images))
+test_image_lesions = torch.tensor(images[random_index], dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
+with torch.no_grad():
+    lesion_prediction = lesion_model(test_image_lesions)
+    lesion_prediction = torch.argmax(lesion_prediction, dim=1).cpu().numpy()[0]
+    lesion_prediction = post_process(lesion_prediction)
+
+test_image_disc = torch.tensor(images_OD[random_index], dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
+with torch.no_grad():
+    disc_prediction = optic_disc_model(test_image_disc)
+    disc_prediction = torch.sigmoid(disc_prediction).cpu().numpy()[0, 0]
+    disc_prediction = post_process(disc_prediction)
+
+plt.figure(figsize=(15, 5))
+
+plt.subplot(1, 4, 1)
+plt.imshow(images[random_index])
+plt.title("Original Image")
+
+plt.subplot(1, 4, 2)
+plt.imshow(masks[random_index], cmap='gray')
+plt.title("True Lesion Mask")
+
+plt.subplot(1, 4, 3)
+plt.imshow(lesion_prediction, cmap='gray')
+plt.title("Predicted Lesion Mask")
+
+plt.subplot(1, 4, 4)
+plt.imshow(disc_prediction, cmap='gray')
+plt.title("Predicted Optic Disc")
 
 plt.show()
