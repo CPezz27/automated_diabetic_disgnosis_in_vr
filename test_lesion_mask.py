@@ -47,8 +47,8 @@ def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
     return test_images, test_masks
 
 
-lesion_model = load_model('lesion_mask_model.keras')
-optic_disc_model = load_model('optic_disc_model.keras')
+lesion_model = load_model('lesion_model.pth')
+optic_disc_model = load_model('optic_disc_model.pth')
 
 lesion_mask_types = ["EX", "MA", "HE", "SE"]
 
