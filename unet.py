@@ -3,12 +3,33 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
 import segmentation_models_pytorch as smp
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+train_losses_lesion, val_losses_lesion, val_dice_lesion = [], [], []
+train_losses_disc, val_losses_disc, val_dice_disc = [], [], []
+
+
+def dice_score(y_true, y_pred):
+
+    if y_true.shape != y_pred.shape:
+        if y_pred.ndim == 3:
+            y_pred = torch.nn.functional.one_hot(y_pred, num_classes=y_true.shape[1]).permute(0, 3, 1, 2).float()
+
+    y_pred = F.interpolate(y_pred, size=y_true.shape[2:], mode='bilinear', align_corners=False)
+
+    y_true_f = y_true.reshape(y_true.size(0), -1)
+    y_pred_f = y_pred.reshape(y_pred.size(0), -1)
+
+    intersection = (y_true_f * y_pred_f).sum(dim=1)
+    dice = (2. * intersection) / (y_true_f.sum(dim=1) + y_pred_f.sum(dim=1))
+    return dice.mean()
 
 
 def tversky_loss(y_true, y_pred, alpha=0.7, beta=0.3, class_weight=None):
@@ -103,14 +124,23 @@ mask_dir = 'dataset/IDRiD/train/masks'
 lesion_mask_types = ["EX", "MA", "HE", "SE"]
 optic_disc_type = ["OD"]
 
+
 images, masks = preprocess_data(image_dir, mask_dir, lesion_mask_types)
 images_OD, masks_OD = preprocess_data(image_dir, mask_dir, optic_disc_type)
 
-train_lesion_dataset = CustomDataset(images, masks)
-train_lesion_loader = DataLoader(train_lesion_dataset, batch_size=8, shuffle=True)
+images, images_val, masks, masks_val = train_test_split(images, masks, test_size=0.2, random_state=42)
+images_OD, val_images_OD, masks_OD, val_masks_OD = train_test_split(images_OD, masks_OD, test_size=0.2, random_state=42)
 
+train_lesion_dataset = CustomDataset(images, masks)
+val_lesion_dataset = CustomDataset(images_val, masks_val)
 train_optic_dataset = CustomDataset(images_OD, masks_OD)
+val_OD_dataset = CustomDataset(val_images_OD, val_masks_OD)
+
+train_lesion_loader = DataLoader(train_lesion_dataset, batch_size=8, shuffle=True)
 train_optic_loader = DataLoader(train_optic_dataset, batch_size=8, shuffle=True)
+val_lesion_loader = DataLoader(val_lesion_dataset, batch_size=8, shuffle=True)
+val_optic_loader = DataLoader(val_OD_dataset, batch_size=8, shuffle=True)
+
 
 lesion_model = smp.DeepLabV3Plus(
     encoder_name='resnet34',
@@ -135,6 +165,8 @@ optimizer_lesion = optim.Adam(lesion_model.parameters(), lr=1e-3)
 loss_fn_disc = smp.losses.DiceLoss(mode="binary")
 optimizer_optic = optim.Adam(optic_disc_model.parameters(), lr=1e-3)
 
+scheduler_lesion = ReduceLROnPlateau(optimizer_lesion, mode='min', factor=0.5, patience=5, verbose=True)
+
 num_epochs = 100
 for epoch in range(num_epochs):
     lesion_model.train()
@@ -144,11 +176,23 @@ for epoch in range(num_epochs):
 
         optimizer_lesion.zero_grad()
         outputs = lesion_model(images_batch)
-
         loss = tversky_loss(outputs, masks_batch, class_weight=class_weight)
         loss.backward()
         optimizer_lesion.step()
         epoch_loss_lesions += loss.item()
+
+    lesion_model.eval()
+    val_loss_lesions = 0
+    val_dice_lesions = 0
+    with torch.no_grad():
+        for images_batch, masks_batch in val_lesion_loader:
+            images_batch, masks_batch = images_batch.to(device), masks_batch.to(device)
+            outputs = lesion_model(images_batch)
+            val_loss = tversky_loss(outputs, masks_batch, class_weight=class_weight)
+            val_loss_lesions += val_loss.item()
+            outputs = torch.argmax(outputs, dim=1)
+            dice = dice_score(masks_batch, outputs)
+            val_dice_lesions += dice.item()
 
     optic_disc_model.train()
     epoch_loss_disc = 0
@@ -162,9 +206,36 @@ for epoch in range(num_epochs):
         optimizer_optic.step()
         epoch_loss_disc += loss.item()
 
-    print(f"Epoch [{epoch + 1}/{num_epochs}], Lesion Loss: {epoch_loss_lesions / len(train_lesion_loader):.4f}, "
-          f"Disc Loss: {epoch_loss_disc / len(train_optic_loader):.4f}")
+    optic_disc_model.eval()
+    val_loss_disc = 0
+    val_dice_sum_disc = 0
+    with torch.no_grad():
+        for images_batch, masks_batch in val_optic_loader:
+            images_batch, masks_batch = images_batch.to(device), masks_batch.to(device)
+            outputs = optic_disc_model(images_batch)
+            val_loss = tversky_loss(outputs, masks_batch)
+            val_loss_disc += val_loss.item()
+            outputs = (outputs > 0.5).float()
+            dice = dice_score(masks_batch, outputs)
+            val_dice_sum_disc += dice.item()
 
+    train_losses_lesion.append(epoch_loss_lesions / len(train_lesion_loader))
+    val_losses_lesion.append(val_loss_lesions / len(val_lesion_loader))
+    val_dice_lesion.append(val_dice_lesions / len(val_lesion_loader))
+
+    train_losses_disc.append(epoch_loss_disc / len(train_optic_loader))
+    val_losses_disc.append(val_loss_disc / len(val_optic_loader))
+    val_dice_disc.append(val_dice_sum_disc / len(val_optic_loader))
+
+    print(f"Epoch [{epoch + 1}/{num_epochs}], "
+          f"Lesion Train Loss: {epoch_loss_lesions / len(train_lesion_loader):.4f}, "
+          f"Lesion Val Loss: {val_loss_lesions / len(val_lesion_loader):.4f}, "
+          f"Lesion Val Dice: {val_dice_lesions / len(val_lesion_loader):.4f}, "
+          f"Disc Train Loss: {epoch_loss_disc / len(train_optic_loader):.4f}, "
+          f"Disc Val Loss: {val_loss_disc / len(val_optic_loader):.4f}, "
+          f"Disc Val Dice: {val_dice_sum_disc / len(val_optic_loader):.4f}")
+
+    scheduler_lesion.step(val_loss_lesions / len(val_lesion_loader))
 
 os.makedirs('saved_models', exist_ok=True)
 torch.save(lesion_model.state_dict(), 'saved_models/lesion_model.pth')
@@ -223,4 +294,27 @@ plt.subplot(1, 4, 4)
 plt.imshow(np.squeeze(disc_prediction), cmap='gray')
 plt.title("Predicted Optic Disc")
 
+plt.show()
+
+plt.figure(figsize=(15, 10))
+
+plt.subplot(2, 1, 1)
+plt.plot(range(num_epochs), train_losses_lesion, label='Lesion Train Loss')
+plt.plot(range(num_epochs), val_losses_lesion, label='Lesion Val Loss')
+plt.plot(range(num_epochs), val_dice_lesion, label='Lesion Val Dice')
+plt.xlabel('Epoch')
+plt.ylabel('Metric')
+plt.legend()
+plt.title('Lesion Model Metrics')
+
+plt.subplot(2, 1, 2)
+plt.plot(range(num_epochs), train_losses_disc, label='Disc Train Loss')
+plt.plot(range(num_epochs), val_losses_disc, label='Disc Val Loss')
+plt.plot(range(num_epochs), val_dice_disc, label='Disc Val Dice')
+plt.xlabel('Epoch')
+plt.ylabel('Metric')
+plt.legend()
+plt.title('Optic Disc Model Metrics')
+
+plt.tight_layout()
 plt.show()

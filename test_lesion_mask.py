@@ -1,86 +1,90 @@
 import os
+import random
+
 import numpy as np
 import cv2
+import torch
 import matplotlib.pyplot as plt
-from tensorflow.keras.models import load_model
-from tensorflow.keras.utils import to_categorical
+import segmentation_models_pytorch as smp
 
-image_dir = 'dataset/IDRiD/train/images'
-mask_dir = 'dataset/IDRiD/train/masks'
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+image_dir = 'dataset/IDRiD/test/images'
 
-def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
-    images = []
-    masks = []
-    for filename in os.listdir(image_dir):
-        img_path = os.path.join(image_dir, filename)
-        mask_stack = []
-
-        for lesion_type in lesion_types:
-            mask_filename = filename.replace(".jpg", f"_{lesion_type}.tif")
-            mask_path = os.path.join(mask_dir, mask_filename)
-
-            if os.path.exists(mask_path):
-                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                mask = cv2.resize(mask, target_size) / 255.0
-            else:
-                mask = np.zeros(target_size)
-
-            mask_stack.append(mask)
-
-        if not mask_stack:
-            print(f"Warning: No masks found for {filename}")
-            continue
-
-        mask_stack = np.stack(mask_stack, axis=-1)
-        mask_stack = np.argmax(mask_stack, axis=-1)
-        mask_stack = to_categorical(mask_stack, num_classes=len(lesion_types))
-        masks.append(mask_stack)
-
-        img = cv2.imread(img_path)
-        img = cv2.resize(img, target_size) / 255.0
-        images.append(img)
-
-    test_images = np.array(images)
-    test_masks = np.array(masks)
-
-    return test_images, test_masks
+image_filenames = [f for f in os.listdir(image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+if not image_filenames:
+    raise FileNotFoundError(f"Nessuna immagine trovata nella directory: {image_dir}")
 
 
-lesion_model = load_model('lesion_model.pth')
-optic_disc_model = load_model('optic_disc_model.pth')
+def preprocess_image(image_path, target_size=(128, 128)):
+    img = cv2.imread(image_path)
+    img = cv2.resize(img, target_size) / 255.0
+    return torch.tensor(img, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
 
-lesion_mask_types = ["EX", "MA", "HE", "SE"]
 
-images, masks = preprocess_data(image_dir, mask_dir, lesion_mask_types)
+def post_process(mask, threshold=0.5):
+    if len(mask.shape) == 2:
+        mask = np.expand_dims(mask, axis=0)
 
-optic_disc_type = ["OD"]
+    processed_mask = np.zeros_like(mask)
+    kernel = np.ones((3, 3), np.uint8)
 
-images_OD, masks_OD = preprocess_data(image_dir, mask_dir, optic_disc_type)
+    for c in range(mask.shape[0]):
+        class_mask = mask[c, :, :] > threshold
+        class_mask = cv2.morphologyEx(class_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+        class_mask = cv2.morphologyEx(class_mask, cv2.MORPH_OPEN, kernel)
+        processed_mask[c, :, :] = class_mask
+    return processed_mask
 
-random_index = np.random.randint(0, len(images))
-lesion_prediction = lesion_model.predict(images[random_index:random_index+1])[0, :, :, 0]
-disc_prediction = optic_disc_model.predict(images[random_index:random_index+1])[0, :, :, 0]
 
-print(f"Random index: {random_index}")
+lesion_model = smp.DeepLabV3Plus(
+    encoder_name='resnet34',
+    encoder_weights=None,
+    in_channels=3,
+    classes=4,
+    activation='softmax'
+).to(device)
+lesion_model.load_state_dict(torch.load('saved_models/lesion_model.pth', map_location=device))
+lesion_model.eval()
+
+optic_disc_model = smp.DeepLabV3Plus(
+    encoder_name='resnet34',
+    encoder_weights=None,
+    in_channels=3,
+    classes=1,
+    activation='sigmoid'
+).to(device)
+optic_disc_model.load_state_dict(torch.load('saved_models/optic_disc_model.pth', map_location=device))
+optic_disc_model.eval()
+
+random_image_filename = random.choice(image_filenames)
+test_image_path = os.path.join(image_dir, random_image_filename)
+
+test_image = preprocess_image(test_image_path).to(device)
+
+with torch.no_grad():
+    lesion_prediction = lesion_model(test_image)
+    lesion_prediction = torch.argmax(lesion_prediction, dim=1).cpu().numpy()[0]  # Classi predette
+    lesion_prediction = post_process(lesion_prediction)
+
+with torch.no_grad():
+    disc_prediction = optic_disc_model(test_image)
+    disc_prediction = torch.sigmoid(disc_prediction).cpu().numpy()[0, 0]  # Predizione binaria
+    disc_prediction = post_process(disc_prediction)
 
 plt.figure(figsize=(15, 5))
 
-plt.subplot(1, 4, 1)
-plt.imshow(images[random_index])
+plt.subplot(1, 3, 1)
+plt.imshow(cv2.imread(test_image_path)[:, :, ::-1])
 plt.title("Original Image")
 
-plt.subplot(1, 4, 2)
-plt.imshow(masks[random_index], cmap='gray')
-plt.title("True Lesion Mask")
-
-plt.subplot(1, 4, 3)
-plt.imshow(lesion_prediction, cmap='gray')
+plt.subplot(1, 3, 2)
+plt.imshow(lesion_prediction.squeeze(), cmap='gray')
 plt.title("Predicted Lesion Mask")
 
+plt.subplot(1, 3, 3)
+plt.imshow(disc_prediction.squeeze(), cmap='gray')
+plt.title("Predicted Optic Disc Mask")
 
-plt.subplot(1, 4, 4)
-plt.imshow(disc_prediction, cmap='gray')
-plt.title("Predicted Optic Disc")
-
+plt.tight_layout()
 plt.show()
