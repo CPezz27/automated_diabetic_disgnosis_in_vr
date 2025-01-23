@@ -27,11 +27,18 @@ def tversky_loss(y_true, y_pred, alpha=0.7, beta=0.3, class_weight=None):
 
 
 def post_process(mask, threshold=0.5):
-    mask = (mask > threshold).astype(np.uint8)
+    if len(mask.shape) == 2:
+        mask = np.expand_dims(mask, axis=0)
+
+    processed_mask = np.zeros_like(mask)
     kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    return mask
+
+    for c in range(mask.shape[0]):
+        class_mask = mask[c, :, :] > threshold
+        class_mask = cv2.morphologyEx(class_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+        class_mask = cv2.morphologyEx(class_mask, cv2.MORPH_OPEN, kernel)
+        processed_mask[c, :, :] = class_mask
+    return processed_mask
 
 
 def combine_image_with_mask(image, mask):
@@ -103,7 +110,7 @@ train_lesion_dataset = CustomDataset(images, masks)
 train_lesion_loader = DataLoader(train_lesion_dataset, batch_size=8, shuffle=True)
 
 train_optic_dataset = CustomDataset(images_OD, masks_OD)
-train_optic_loader = DataLoader(train_lesion_dataset, batch_size=8, shuffle=True)
+train_optic_loader = DataLoader(train_optic_dataset, batch_size=8, shuffle=True)
 
 lesion_model = smp.DeepLabV3Plus(
     encoder_name='resnet34',
@@ -128,7 +135,7 @@ optimizer_lesion = optim.Adam(lesion_model.parameters(), lr=1e-3)
 loss_fn_disc = smp.losses.DiceLoss(mode="binary")
 optimizer_optic = optim.Adam(optic_disc_model.parameters(), lr=1e-3)
 
-num_epochs = 20
+num_epochs = 100
 for epoch in range(num_epochs):
     lesion_model.train()
     epoch_loss_lesions = 0
@@ -180,6 +187,24 @@ with torch.no_grad():
     disc_prediction = torch.sigmoid(disc_prediction).cpu().numpy()[0, 0]
     disc_prediction = post_process(disc_prediction)
 
+plt.figure(figsize=(15, 10))
+for i, lesion_type in enumerate(lesion_mask_types):
+
+    predicted_class_mask = np.array(lesion_prediction == i, dtype=np.uint8)
+    predicted_class_mask = np.squeeze(predicted_class_mask)
+    plt.subplot(2, len(lesion_mask_types), i + 1)
+    plt.imshow(predicted_class_mask, cmap='gray')
+    plt.title(f"Predicted Mask - {lesion_type}")
+
+    true_class_mask = masks[random_index, :, :, i]
+    true_class_mask = np.squeeze(true_class_mask)
+    plt.subplot(2, len(lesion_mask_types), len(lesion_mask_types) + i + 1)
+    plt.imshow(true_class_mask, cmap='gray')
+    plt.title(f"True Mask - {lesion_type}")
+
+plt.tight_layout()
+plt.show()
+
 plt.figure(figsize=(15, 5))
 
 plt.subplot(1, 4, 1)
@@ -191,11 +216,11 @@ plt.imshow(masks[random_index], cmap='gray')
 plt.title("True Lesion Mask")
 
 plt.subplot(1, 4, 3)
-plt.imshow(lesion_prediction, cmap='gray')
+plt.imshow(np.squeeze(lesion_prediction), cmap='gray')
 plt.title("Predicted Lesion Mask")
 
 plt.subplot(1, 4, 4)
-plt.imshow(disc_prediction, cmap='gray')
+plt.imshow(np.squeeze(disc_prediction), cmap='gray')
 plt.title("Predicted Optic Disc")
 
 plt.show()
