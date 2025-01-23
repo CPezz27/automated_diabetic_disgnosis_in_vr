@@ -64,12 +64,12 @@ test_image = preprocess_image(test_image_path).to(device)
 
 with torch.no_grad():
     lesion_prediction = lesion_model(test_image)
-    lesion_prediction = torch.argmax(lesion_prediction, dim=1).cpu().numpy()[0]  # Classi predette
+    lesion_prediction = torch.argmax(lesion_prediction, dim=1).cpu().numpy()[0]
     lesion_prediction = post_process(lesion_prediction)
 
 with torch.no_grad():
     disc_prediction = optic_disc_model(test_image)
-    disc_prediction = torch.sigmoid(disc_prediction).cpu().numpy()[0, 0]  # Predizione binaria
+    disc_prediction = torch.sigmoid(disc_prediction).cpu().numpy()[0, 0]
     disc_prediction = post_process(disc_prediction)
 
 plt.figure(figsize=(15, 5))

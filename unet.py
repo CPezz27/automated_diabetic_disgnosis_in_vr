@@ -273,8 +273,9 @@ for i, lesion_type in enumerate(lesion_mask_types):
     plt.imshow(true_class_mask, cmap='gray')
     plt.title(f"True Mask - {lesion_type}")
 
-plt.tight_layout()
-plt.show()
+    plt.tight_layout()
+    plt.show()
+
 
 plt.figure(figsize=(15, 5))
 
