@@ -184,7 +184,7 @@ images_OD, masks_OD = preprocess_data(image_dir, mask_dir, optic_disc_type)
 masks = preprocess_masks(masks, num_classes=len(lesion_mask_types))
 masks_OD = preprocess_masks(masks_OD, num_classes=len(optic_disc_type))
 
-for mask in masks:
+'''for mask in masks:
     print("Mask shape:", mask.shape)  # Verifica la forma della maschera
     print("Mask min:", mask.min(), "Mask max:", mask.max())  # Debug per vedere i valori min/max
     mask_to_show = np.squeeze(mask[0].cpu().numpy())  # Rimuovi la dimensione extra del batch
@@ -195,7 +195,7 @@ for mask in masks:
     plt.subplot(1, 1, 1)
     plt.imshow(mask_to_show, cmap='gray')
     plt.title("Maschera preprocessata")
-    plt.show()
+    plt.show()'''
 
 
 images, images_val, masks, masks_val = train_test_split(images, masks, test_size=0.2, random_state=42)
@@ -237,7 +237,7 @@ optimizer_optic = optim.Adam(optic_disc_model.parameters(), lr=1e-3)
 
 scheduler_lesion = ReduceLROnPlateau(optimizer_lesion, mode='min', factor=0.5, patience=5, verbose=True)
 
-num_epochs = 5
+num_epochs = 100
 for epoch in range(num_epochs):
     lesion_model.train()
     epoch_loss_lesions = 0
