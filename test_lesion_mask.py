@@ -11,6 +11,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 image_dir = 'dataset/IDRiD/test/images'
 
+output_dir = 'dataset/IDRiD/test/output_masks'
+os.makedirs(output_dir, exist_ok=True)
+
 image_filenames = [f for f in os.listdir(image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 if not image_filenames:
     raise FileNotFoundError(f"Nessuna immagine trovata nella directory: {image_dir}")
@@ -37,6 +40,12 @@ def post_process(mask, threshold=0.5):
     return processed_mask
 
 
+if not os.path.exists('saved_models/lesion_model.pth'):
+    raise FileNotFoundError("Il modello lesion_model.pth non esiste.")
+if not os.path.exists('saved_models/optic_disc_model.pth'):
+    raise FileNotFoundError("Il modello optic_disc_model.pth non esiste.")
+
+
 lesion_model = smp.DeepLabV3Plus(
     encoder_name='resnet34',
     encoder_weights=None,
@@ -44,7 +53,7 @@ lesion_model = smp.DeepLabV3Plus(
     classes=4,
     activation='softmax'
 ).to(device)
-lesion_model.load_state_dict(torch.load('saved_models/lesion_model.pth', map_location=device))
+lesion_model.load_state_dict(torch.load('saved_models/lesion_model.pth', map_location=device, weights_only=True))
 lesion_model.eval()
 
 optic_disc_model = smp.DeepLabV3Plus(
@@ -54,7 +63,7 @@ optic_disc_model = smp.DeepLabV3Plus(
     classes=1,
     activation='sigmoid'
 ).to(device)
-optic_disc_model.load_state_dict(torch.load('saved_models/optic_disc_model.pth', map_location=device))
+optic_disc_model.load_state_dict(torch.load('saved_models/optic_disc_model.pth', map_location=device, weights_only=True))
 optic_disc_model.eval()
 
 random_image_filename = random.choice(image_filenames)
@@ -71,6 +80,20 @@ with torch.no_grad():
     disc_prediction = optic_disc_model(test_image)
     disc_prediction = torch.sigmoid(disc_prediction).cpu().numpy()[0, 0]
     disc_prediction = post_process(disc_prediction)
+
+
+lesion_mask_path = os.path.join(output_dir, f"{os.path.splitext(random_image_filename)[0]}_lesion_mask.png")
+disc_mask_path = os.path.join(output_dir, f"{os.path.splitext(random_image_filename)[0]}_disc_mask.png")
+
+if cv2.imwrite(lesion_mask_path, (lesion_prediction.squeeze() * 255).astype(np.uint8)):
+    print(f"Lesion mask saved in: {lesion_mask_path}")
+else:
+    print(f"Error file: {lesion_mask_path}")
+
+if cv2.imwrite(disc_mask_path, (disc_prediction.squeeze() * 255).astype(np.uint8)):
+    print(f"Disc mask saved in: {disc_mask_path}")
+else:
+    print(f"Errore file: {disc_mask_path}")
 
 plt.figure(figsize=(15, 5))
 
