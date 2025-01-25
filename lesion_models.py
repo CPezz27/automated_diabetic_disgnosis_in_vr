@@ -1,108 +1,127 @@
 import os
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 import segmentation_models_pytorch as smp
 import torch
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from sklearn.model_selection import KFold
+from sklearn.metrics import roc_auc_score
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-train_losses_lesion, val_losses_lesion, val_dice_lesion = [], [], []
-train_losses_disc, val_losses_disc, val_dice_disc = [], [], []
+
+image_dir = 'dataset/IDRiD/train/images'
+mask_dir = 'dataset/IDRiD/train/masks'
+
+lesion_mask_types = ["EX", "MA", "HE", "SE"]
+optic_disk_type = ["OD"]
 
 
-def preprocess_masks(masks, num_classes):
+class CombinedDataset(Dataset):
+    def __init__(self, inputs, masks):
+        self.inputs = inputs
+        self.masks = masks
 
-    masks_tensor = torch.tensor(masks, dtype=torch.int64)
-    print("Before one-hot encoding:", masks_tensor.shape)
-    masks_one_hot = torch.nn.functional.one_hot(masks_tensor, num_classes=num_classes)
+    def __len__(self):
+        return len(self.inputs)
 
-    print("After one-hot encoding:", masks_one_hot.shape)  # Debug per vedere l'output della one-hot encoding
-
-    if masks_one_hot.shape[2] == 1:
-        masks_one_hot = masks_one_hot.squeeze(2)
-
-    masks_one_hot = masks_one_hot.permute(0, 3, 1, 2).float()
-
-    print("After permute and squeeze:", masks_one_hot.min(), masks_one_hot.max())
-
-    return masks_one_hot
+    def __getitem__(self, idx):
+        input_tensor = torch.tensor(self.inputs[idx], dtype=torch.float32).permute(2, 0, 1)
+        mask_tensor = torch.tensor(self.masks[idx], dtype=torch.long)
+        return input_tensor, mask_tensor
 
 
-def dice_score(y_true, y_pred, num_classes=None):
-    if num_classes is None:
-        num_classes = y_true.shape[1] if y_true.ndim == 4 else 1
+def augment_image(image, mask):
 
-    if y_pred.ndim == 3:
-        if torch.max(y_pred) >= num_classes:
-            raise ValueError(f"y_pred contiene valori >= num_classes ({num_classes}).")
-        y_pred = torch.nn.functional.one_hot(y_pred.long(), num_classes=num_classes).float()
-    elif y_pred.ndim == 4 and y_pred.shape[1] != num_classes:
-        y_pred = torch.argmax(y_pred, dim=1)
-        y_pred = torch.nn.functional.one_hot(y_pred, num_classes).float()
+    transform = A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomBrightnessContrast(p=0.2),
+        A.ElasticTransform(p=0.3),
+        A.CoarseDropout(p=0.3),
+        A.Normalize(),
+        A.GridDistortion(),
+        A.OpticalDistortion(),
+        ToTensorV2(),
+    ])
 
-    if y_pred.shape[2:] != y_true.shape[2:]:
-        y_pred = F.interpolate(y_pred, size=y_true.shape[2:], mode='bilinear', align_corners=False)
-        raise ValueError(f"Dimension mismatch: y_true {y_true.shape}, y_pred {y_pred.shape}")
-
-    y_pred.permute(0, 3, 1, 2)
-
-    y_true_f = y_true.reshape(y_true.size(0), -1)
-    y_pred_f = y_pred.reshape(y_pred.size(0), -1)
-
-    intersection = (y_true_f * y_pred_f).sum(dim=1)
-    dice = (2. * intersection) / (y_true_f.sum(dim=1) + y_pred_f.sum(dim=1))
-    return dice.mean()
-
-
-def tversky_loss(y_true, y_pred, alpha=0.7, beta=0.3, class_weight=None):
-
-    if y_true.shape[2:] != y_pred.shape[2:]:
-        y_pred = y_pred.permute(0, 2, 1, 3)
-
-    tp = torch.sum(y_true * y_pred, dim=(2, 3))
-    fp = torch.sum((1 - y_true) * y_pred, dim=(2, 3))
-    fn = torch.sum(y_true * (1 - y_pred), dim=(2, 3))
-
-    tversky = tp / (tp + alpha * fp + beta * fn + 1e-7)
-
-    loss = 1 - tversky
-
-    if class_weight is not None:
-        class_weight = class_weight.view(1, -1, 1, 1)
-        loss = loss.unsqueeze(-1).unsqueeze(-1)
-        loss *= class_weight
-    return loss.mean()
-
-
-def post_process(mask, threshold=0.5):
-    if len(mask.shape) == 2:
-        mask = np.expand_dims(mask, axis=0)
-
-    processed_mask = np.zeros_like(mask)
-    kernel = np.ones((3, 3), np.uint8)
-
-    for c in range(mask.shape[0]):
-        class_mask = mask[c, :, :] > threshold
-        class_mask = cv2.morphologyEx(class_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-        class_mask = cv2.morphologyEx(class_mask, cv2.MORPH_OPEN, kernel)
-        processed_mask[c, :, :] = class_mask
-    return processed_mask
+    augmented = transform(image=image, mask=mask)
+    return augmented['image'], augmented['mask']
 
 
 def combine_image_with_mask(image, mask):
-    return np.concatenate([image, mask], axis=-1)
+    return np.concatenate([image, np.dstack(mask)], axis=-1)
 
 
-def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
-    images = []
-    masks = []
+def tversky_loss(y_pred, y_true, alpha=0.7, beta=0.3, smooth=1e-6, class_weights=None):
+
+    y_true = (y_true > 0.5).float()
+
+    y_true = y_true.permute(0, 3, 1, 2)
+
+    if isinstance(y_true, np.ndarray):
+        y_true = torch.tensor(y_true, dtype=torch.float32)
+
+    if isinstance(y_pred, np.ndarray):
+        y_pred = torch.tensor(y_pred, dtype=torch.float32)
+
+    tp = (y_pred * y_true).sum(dim=(2, 3))
+    fp = ((1 - y_true) * y_pred).sum(dim=(2, 3))
+    fn = (y_true * (1 - y_pred)).sum(dim=(2, 3))
+
+    tversky_index = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+
+    if class_weights is not None:
+        tversky_index *= class_weights
+
+    return 1 - tversky_index.mean()
+
+
+def dice_score(y_pred, y_true, smooth=1e-6):
+    y_true = y_true.permute(0, 3, 1, 2)
+
+    intersection = (y_pred * y_true).sum(dim=(2, 3))
+    union = y_pred.sum(dim=(2, 3)) + y_true.sum(dim=(2, 3))
+
+    dice = (2.0 * intersection + smooth) / (union + smooth)
+    return dice.mean().item()
+
+
+def iou_score(y_pred, y_true, smooth=1e-6):
+    y_true = y_true.permute(0, 3, 1, 2)
+
+    intersection = (y_pred * y_true).sum(dim=(2, 3))
+    union = y_pred.sum(dim=(2, 3)) + y_true.sum(dim=(2, 3)) - intersection
+
+    iou = (intersection + smooth) / (union + smooth)
+    return iou.mean().item()
+
+
+def calculate_class_weights(loader, num_classes):
+    class_counts = torch.zeros(num_classes, dtype=torch.float32)
+
+    for _, masks_batch in loader:
+        masks_batch = masks_batch.view(-1)
+        for c in range(num_classes):
+            class_counts[c] += (masks_batch == c).sum()
+
+    total_count = class_counts.sum()
+    class_weights = total_count / (class_counts + 1e-6)
+    return class_weights / class_weights.sum()
+
+
+def preprocess_data(image_dir, mask_dir, lesion_types, optic_disk_type, target_size=(128, 128)):
+    combined_inputs = []
+    combined_masks = []
+
     for filename in os.listdir(image_dir):
         img_path = os.path.join(image_dir, filename)
+        img = cv2.imread(img_path)
+        img = cv2.resize(img, target_size) / 255.0
         mask_stack = []
 
         for lesion_type in lesion_types:
@@ -112,293 +131,123 @@ def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
             if os.path.exists(mask_path):
                 mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
                 mask = cv2.resize(mask, target_size) / 255.0
-
-                if np.sum(mask) == 0:
-                    print(f"Empty mask for {mask_filename}")
             else:
                 mask = np.zeros(target_size)
 
             mask_stack.append(mask)
 
-        if not mask_stack:
-            print(f"Warning: No masks found for {filename}")
-            continue
+        optic_disk_filename = filename.replace(".jpg", f"_{optic_disk_type[0]}.tif")
+        optic_disk_path = os.path.join(mask_dir, optic_disk_filename)
 
-        mask_stack = np.stack(mask_stack, axis=-1)
-        mask_stack = np.clip(np.sum(mask_stack, axis=-1), 0, 1)
+        if os.path.exists(optic_disk_path):
+            optic_disk_mask = cv2.imread(optic_disk_path, cv2.IMREAD_GRAYSCALE)
+            optic_disk_mask = cv2.resize(optic_disk_mask, target_size) / 255.0
+        else:
+            optic_disk_mask = np.zeros(target_size)
 
-        masks.append(mask_stack)
+        combined_input = np.concatenate([img, np.dstack(mask_stack)], axis=-1)
+        combined_inputs.append(combined_input)
 
-        img = cv2.imread(img_path)
-        img = cv2.resize(img, target_size) / 255.0
-        images.append(img)
-    ''' Debug:
+        combined_mask = np.dstack(mask_stack + [optic_disk_mask])
+        combined_masks.append(combined_mask)
 
-        plt.figure(figsize=(10, 5))
-
-        plt.subplot(1, 2, 1)
-        plt.imshow(img)
-        plt.title("Image")
-        plt.axis("off")
-
-        plt.subplot(1, 2, 2)
-        plt.imshow(mask_stack, cmap="viridis")
-        plt.title("Mask")
-        plt.axis("off")
-
-        plt.show()'''
-
-    return np.array(images), np.array(masks)
+    return np.array(combined_inputs), np.array(combined_masks)
 
 
-class CustomDataset(Dataset):
-    def __init__(self, images, masks):
-        self.images = images
-        self.masks = masks
+images, combined_masks = preprocess_data(image_dir, mask_dir, lesion_mask_types, optic_disk_type)
 
-    def __len__(self):
-        return len(self.images)
+train_images, val_images, train_combined_masks, val_combined_mask = train_test_split(images, combined_masks,
+                                                                                     test_size=0.2, random_state=42)
 
-    def __getitem__(self, idx):
-        image = self.images[idx]
-        mask = self.masks[idx]
-
-        if len(mask.shape) == 2:
-            mask = np.expand_dims(mask, axis=-1)
-
-        image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
-        mask = torch.tensor(mask, dtype=torch.float32).permute(2, 0, 1)
-        return image, mask
-
-
-image_dir = 'dataset/IDRiD/train/images'
-mask_dir = 'dataset/IDRiD/train/masks'
-
-lesion_mask_types = ["EX", "MA", "HE", "SE"]
-optic_disc_type = ["OD"]
-
-
-images, masks = preprocess_data(image_dir, mask_dir, lesion_mask_types)
-images_OD, masks_OD = preprocess_data(image_dir, mask_dir, optic_disc_type)
-
-masks = preprocess_masks(masks, num_classes=len(lesion_mask_types))
-masks_OD = preprocess_masks(masks_OD, num_classes=len(optic_disc_type))
-
-'''for mask in masks:
-    print("Mask shape:", mask.shape)  # Verifica la forma della maschera
-    print("Mask min:", mask.min(), "Mask max:", mask.max())  # Debug per vedere i valori min/max
-    mask_to_show = np.squeeze(mask[0].cpu().numpy())  # Rimuovi la dimensione extra del batch
-    mask_to_show = np.clip(mask_to_show, 0, 1)
-
-    mask_class_to_show = mask_to_show[1]
-
-    plt.subplot(1, 1, 1)
-    plt.imshow(mask_to_show, cmap='gray')
-    plt.title("Maschera preprocessata")
-    plt.show()'''
-
-
-images, images_val, masks, masks_val = train_test_split(images, masks, test_size=0.2, random_state=42)
-images_OD, val_images_OD, masks_OD, val_masks_OD = train_test_split(images_OD, masks_OD, test_size=0.2, random_state=42)
-
-train_lesion_dataset = CustomDataset(images, masks)
-val_lesion_dataset = CustomDataset(images_val, masks_val)
-train_optic_dataset = CustomDataset(images_OD, masks_OD)
-val_OD_dataset = CustomDataset(val_images_OD, val_masks_OD)
-
-train_lesion_loader = DataLoader(train_lesion_dataset, batch_size=8, shuffle=True)
-train_optic_loader = DataLoader(train_optic_dataset, batch_size=8, shuffle=True)
-val_lesion_loader = DataLoader(val_lesion_dataset, batch_size=8, shuffle=True)
-val_optic_loader = DataLoader(val_OD_dataset, batch_size=8, shuffle=True)
-
+k = 5
+num_classes = len(lesion_mask_types) + len(optic_disk_type)
+kf = KFold(n_splits=k, shuffle=True, random_state=42)
 
 lesion_model = smp.DeepLabV3Plus(
-    encoder_name='resnet34',
+    encoder_name='resnet50',
     encoder_weights='imagenet',
-    in_channels=3,
-    classes=len(lesion_mask_types),
-    activation='softmax'
+    in_channels=3 + len(lesion_mask_types) + len(optic_disk_type),
+    classes=len(lesion_mask_types) + 1,
+    activation=None
 ).to(device)
 
-optic_disc_model = smp.DeepLabV3Plus(
-    encoder_name='resnet34',
-    encoder_weights='imagenet',
-    in_channels=3,
-    classes=len(optic_disc_type),
-    activation='sigmoid'
-).to(device)
+modules_to_modify = []
 
-class_weight = torch.tensor([0.2, 0.3, 0.3, 0.2], device=device)
-loss_fn_lesion = smp.losses.DiceLoss(mode="multiclass")
-optimizer_lesion = optim.Adam(lesion_model.parameters(), lr=1e-3)
+for name, module in lesion_model.decoder.named_modules():
+    if isinstance(module, torch.nn.Conv2d):
+        modules_to_modify.append((name, module))
 
-loss_fn_disc = smp.losses.DiceLoss(mode="binary")
-optimizer_optic = optim.Adam(optic_disc_model.parameters(), lr=1e-3)
+for name, module in modules_to_modify:
+    setattr(lesion_model.decoder, name, torch.nn.Sequential(
+        module, torch.nn.Dropout2d(p=0.5)
+    ))
 
-scheduler_lesion = ReduceLROnPlateau(optimizer_lesion, mode='min', factor=0.5, patience=5, verbose=True)
+optimizer = optim.Adam(lesion_model.parameters(), lr=1e-3, weight_decay=1e-4)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
 
-num_epochs = 100
-for epoch in range(num_epochs):
-    lesion_model.train()
-    epoch_loss_lesions = 0
-    for images_batch, masks_batch in train_lesion_loader:
-        images_batch, masks_batch = images_batch.to(device), masks_batch.to(device)
+num_epochs = 50
+for fold, (train_idx, val_idx) in enumerate(kf.split(images)):
+    print(f"Fold {fold + 1}/{k}")
 
-        optimizer_lesion.zero_grad()
-        outputs = lesion_model(images_batch)
+    train_images, val_images = images[train_idx], images[val_idx]
+    train_combined_masks, val_combined_masks = combined_masks[train_idx], combined_masks[val_idx]
 
-        masks_batch.permute(0, 2, 1, 3)
+    train_dataset = CombinedDataset(train_images, train_combined_masks)
+    val_dataset = CombinedDataset(val_images, val_combined_masks)
 
-        loss = tversky_loss(outputs, masks_batch, class_weight=class_weight)
-        loss.backward()
-        optimizer_lesion.step()
-        epoch_loss_lesions += loss.item()
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
 
-    lesion_model.eval()
-    val_loss_lesions = 0
-    val_dice_lesions = 0
-    with torch.no_grad():
-        for images_batch, masks_batch in val_lesion_loader:
+    class_weights = calculate_class_weights(train_loader, num_classes).to(device)
+    print(f"Class Weights for Fold {fold + 1}: {class_weights}")
+
+    for epoch in range(num_epochs):
+        lesion_model.train()
+        epoch_loss = 0
+        for images_batch, masks_batch in train_loader:
             images_batch, masks_batch = images_batch.to(device), masks_batch.to(device)
+            optimizer.zero_grad()
             outputs = lesion_model(images_batch)
+            outputs = torch.softmax(outputs, dim=1)
+            loss = tversky_loss(outputs, masks_batch, class_weights=class_weights)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
 
-            masks_batch = masks_batch.permute(0, 2, 1, 3)
+        val_dice = 0
+        val_iou = 0
+        val_roc_auc = 0
 
-            val_loss = tversky_loss(outputs, masks_batch, class_weight=class_weight)
-            val_loss_lesions += val_loss.item()
+        lesion_model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for images_batch, masks_batch in val_loader:
+                images_batch, masks_batch = images_batch.to(device), masks_batch.to(device)
+                outputs = lesion_model(images_batch)
+                probs = torch.softmax(outputs, dim=1)
+                true_labels = masks_batch.numpy()
 
-            dice = dice_score(masks_batch, outputs, num_classes=len(lesion_mask_types))
-            val_dice_lesions += dice.item()
+                try:
+                    auc = roc_auc_score(true_labels.ravel(), probs.cpu().numpy().ravel(), average='macro',
+                                        multi_class='ovr')
+                    val_roc_auc += auc
+                except ValueError:
+                    pass
 
-    optic_disc_model.train()
-    epoch_loss_disc = 0
-    for images_batch, masks_batch in train_optic_loader:
-        images_batch, masks_batch = images_batch.to(device), masks_batch.to(device)
+                val_dice += dice_score(outputs, masks_batch)
+                val_iou += iou_score(outputs, masks_batch)
 
-        optimizer_optic.zero_grad()
-        outputs = optic_disc_model(images_batch)
+                loss = tversky_loss(probs, masks_batch, class_weights=class_weights)
+                val_loss += loss.item()
 
-        masks_batch = preprocess_masks(masks_batch, num_classes=len(lesion_mask_types))
+        scheduler.step(val_loss)
 
-        loss = tversky_loss(outputs, masks_batch, class_weight=class_weight)
-        loss.backward()
-        optimizer_optic.step()
-        epoch_loss_disc += loss.item()
+        val_dice /= len(val_loader)
+        val_iou /= len(val_loader)
+        val_roc_auc /= len(val_loader)
 
-    optic_disc_model.eval()
-    val_loss_disc = 0
-    val_dice_sum_disc = 0
-    with torch.no_grad():
-        for images_batch, masks_batch in val_optic_loader:
-            images_batch, masks_batch = images_batch.to(device), masks_batch.to(device)
-            outputs = optic_disc_model(images_batch)
-
-            masks_batch = masks_batch.permute(0, 2, 1, 3)
-
-            val_loss = tversky_loss(outputs, masks_batch)
-            val_loss_disc += val_loss.item()
-            outputs = (outputs > 0.5).float()
-            dice = dice_score(masks_batch, outputs)
-            val_dice_sum_disc += dice.item()
-
-    train_losses_lesion.append(epoch_loss_lesions / len(train_lesion_loader))
-    val_losses_lesion.append(val_loss_lesions / len(val_lesion_loader))
-    val_dice_lesion.append(val_dice_lesions / len(val_lesion_loader))
-
-    train_losses_disc.append(epoch_loss_disc / len(train_optic_loader))
-    val_losses_disc.append(val_loss_disc / len(val_optic_loader))
-    val_dice_disc.append(val_dice_sum_disc / len(val_optic_loader))
-
-    print(f"Epoch [{epoch + 1}/{num_epochs}], "
-          f"Lesion Train Loss: {epoch_loss_lesions / len(train_lesion_loader):.4f}, "
-          f"Lesion Val Loss: {val_loss_lesions / len(val_lesion_loader):.4f}, "
-          f"Lesion Val Dice: {val_dice_lesions / len(val_lesion_loader):.4f}, "
-          f"Disc Train Loss: {epoch_loss_disc / len(train_optic_loader):.4f}, "
-          f"Disc Val Loss: {val_loss_disc / len(val_optic_loader):.4f}, "
-          f"Disc Val Dice: {val_dice_sum_disc / len(val_optic_loader):.4f}")
-
-    scheduler_lesion.step(val_loss_lesions / len(val_lesion_loader))
+        print(f"Epoch [{epoch + 1}/{num_epochs}], Train Loss: {epoch_loss / len(train_loader):.4f}, "
+              f"Val Loss: {val_loss / len(val_loader):.4f}, Dice Score: {val_dice:.4f}, IoU: {val_iou:.4f}")
 
 os.makedirs('saved_models', exist_ok=True)
-torch.save(lesion_model.state_dict(), 'saved_models/lesion_model.pth')
-torch.save(optic_disc_model.state_dict(), 'saved_models/optic_disc_model.pth')
-
-lesion_model.eval()
-optic_disc_model.eval()
-
-
-random_index = np.random.randint(0, len(images))
-test_image_lesions = torch.tensor(images[random_index], dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
-with torch.no_grad():
-    lesion_prediction = lesion_model(test_image_lesions)
-    lesion_prediction = torch.argmax(lesion_prediction, dim=1).cpu().numpy()[0]
-    lesion_prediction = post_process(lesion_prediction)
-
-test_image_disc = torch.tensor(images_OD[random_index], dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
-with torch.no_grad():
-    disc_prediction = optic_disc_model(test_image_disc)
-    disc_prediction = torch.sigmoid(disc_prediction).cpu().numpy()[0, 0]
-    disc_prediction = post_process(disc_prediction)
-'''
-plt.figure(figsize=(15, 10))
-for i, lesion_type in enumerate(lesion_mask_types):
-
-    predicted_class_mask = np.array(lesion_prediction == i, dtype=np.uint8)
-    predicted_class_mask = np.squeeze(predicted_class_mask)
-    plt.subplot(2, len(lesion_mask_types), i + 1)
-    plt.imshow(predicted_class_mask, cmap='gray')
-    plt.title(f"Predicted Mask - {lesion_type}")
-
-    true_class_mask = masks[random_index, :, :, i]
-    true_class_mask = np.squeeze(true_class_mask)
-    plt.subplot(2, len(lesion_mask_types), len(lesion_mask_types) + i + 1)
-    plt.imshow(true_class_mask, cmap='gray')
-    plt.title(f"True Mask - {lesion_type}")
-
-    plt.tight_layout()
-    plt.show()
-
-'''
-plt.figure(figsize=(15, 5))
-
-plt.subplot(1, 4, 1)
-plt.imshow(images[random_index])
-plt.title("Original Image")
-
-plt.subplot(1, 4, 2)
-combined_mask = np.sum(masks[random_index].cpu().numpy(), axis=0)
-plt.imshow(combined_mask, cmap='gray')
-plt.title("Combined Mask")
-
-plt.subplot(1, 4, 3)
-plt.imshow(np.squeeze(lesion_prediction), cmap='gray')
-plt.title("Predicted Lesion Mask")
-
-plt.subplot(1, 4, 4)
-plt.imshow(np.squeeze(disc_prediction), cmap='gray')
-plt.title("Predicted Optic Disc")
-
-plt.show()
-
-plt.figure(figsize=(15, 10))
-
-plt.subplot(2, 1, 1)
-plt.plot(range(num_epochs), train_losses_lesion, label='Lesion Train Loss')
-plt.plot(range(num_epochs), val_losses_lesion, label='Lesion Val Loss')
-plt.plot(range(num_epochs), val_dice_lesion, label='Lesion Val Dice')
-plt.xlabel('Epoch')
-plt.ylabel('Metric')
-plt.legend()
-plt.title('Lesion Model Metrics')
-
-plt.subplot(2, 1, 2)
-plt.plot(range(num_epochs), train_losses_disc, label='Disc Train Loss')
-plt.plot(range(num_epochs), val_losses_disc, label='Disc Val Loss')
-plt.plot(range(num_epochs), val_dice_disc, label='Disc Val Dice')
-plt.xlabel('Epoch')
-plt.ylabel('Metric')
-plt.legend()
-plt.title('Optic Disc Model Metrics')
-
-plt.tight_layout()
-plt.show()
+torch.save(lesion_model.state_dict(), 'saved_models/lesion_model_with_combined_masks.pth')
