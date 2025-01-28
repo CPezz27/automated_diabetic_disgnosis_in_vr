@@ -11,6 +11,7 @@ from albumentations.pytorch import ToTensorV2
 from sklearn.model_selection import KFold
 from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -30,7 +31,7 @@ class CombinedDataset(Dataset):
 
     def __getitem__(self, idx):
         input_tensor = torch.tensor(self.inputs[idx], dtype=torch.float32).permute(2, 0, 1)
-        mask_tensor = torch.tensor(self.masks[idx], dtype=torch.int64).permute(2, 0, 1)
+        mask_tensor = torch.tensor(self.masks[idx], dtype=torch.float32).unsqueeze(0)
         return input_tensor, mask_tensor
 
 
@@ -39,6 +40,7 @@ def augment_image(image, mask):
     transform = A.Compose([
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
+        A.Rotate(limit=45, p=0.5),
         A.RandomBrightnessContrast(p=0.2),
         A.ElasticTransform(p=0.3),
         A.CoarseDropout(p=0.3),
@@ -55,6 +57,17 @@ def augment_image(image, mask):
 def combine_image_with_mask(image, mask):
     result = np.concatenate([image, np.dstack(mask)], axis=-1)
     return result
+
+
+def calculate_metrics(y_pred, y_true):
+    y_true = (y_true > 0.5).float()
+    y_pred = (y_pred > 0.5).float()
+
+    precision = precision_score(y_true.cpu().numpy().ravel(), y_pred.cpu().numpy().ravel())
+    recall = recall_score(y_true.cpu().numpy().ravel(), y_pred.cpu().numpy().ravel())
+    f1 = f1_score(y_true.cpu().numpy().ravel(), y_pred.cpu().numpy().ravel())
+
+    return precision, recall, f1
 
 
 def tversky_loss(y_pred, y_true, alpha=0.6, beta=0.4, smooth=1e-6, class_weights=None):
@@ -81,6 +94,7 @@ def tversky_loss(y_pred, y_true, alpha=0.6, beta=0.4, smooth=1e-6, class_weights
 
 
 def dice_score(y_pred, y_true, smooth=1e-6):
+    y_true = (y_true > 0.5).float()
 
     intersection = (y_pred * y_true).sum(dim=(2, 3))
     union = y_pred.sum(dim=(2, 3)) + y_true.sum(dim=(2, 3))
@@ -90,6 +104,7 @@ def dice_score(y_pred, y_true, smooth=1e-6):
 
 
 def iou_score(y_pred, y_true, smooth=1e-6):
+    y_true = (y_true > 0.5).float()
 
     intersection = (y_pred * y_true).sum(dim=(2, 3))
     union = y_pred.sum(dim=(2, 3)) + y_true.sum(dim=(2, 3)) - intersection
@@ -132,6 +147,29 @@ def calculate_class_weights(loader, num_classes):
     return class_weights / class_weights.sum()
 
 
+def visualize_activations(model, images_batch):
+    model.eval()
+    with torch.no_grad():
+        activations = model(images_batch)
+        activations = torch.softmax(activations, dim=1)
+        activations = activations.cpu().numpy()
+
+    for i in range(len(images_batch)):
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 2, 1)
+        plt.title('Input Image')
+
+        image = images_batch[i].cpu().numpy().transpose(1, 2, 0)
+        if image.shape[2] > 3:
+            image = image[:, :, :3]
+
+        plt.imshow(image)
+        plt.subplot(1, 2, 2)
+        plt.title('Activation Map')
+        plt.imshow(activations[i, 1], cmap='hot')
+        plt.show()
+
+
 def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
 
     combined_inputs = []
@@ -163,9 +201,11 @@ def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
 
         masks.append(np.stack(mask_stack, axis=-1))
 
-        for combined_mask in masks:
-            combined_mask = (cv2.resize(combined_mask, target_size) > 0).astype(np.float32)
-            combined_masks.append(combined_mask)
+    for mask_stack in masks:
+        combined_mask = np.any(mask_stack, axis=-1).astype(np.float32)
+        combined_masks.append(combined_mask)
+
+        # print(f"combined_masks shapes: {combined_masks}")
 
     return np.array(images), np.array(combined_inputs), np.array(combined_masks)
 
@@ -195,10 +235,11 @@ for name, module in modules_to_modify:
         module, torch.nn.Dropout2d(p=0.5)
     ))
 
-optimizer = optim.Adam(lesion_model.parameters(), lr=1e-3, weight_decay=1e-4)
+num_epochs = 50
+
+optimizer = optim.Adam(lesion_model.parameters(), lr=1e-4, weight_decay=1e-4)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
 
-num_epochs = 50
 for fold, (train_idx, val_idx) in enumerate(kf.split(combined_mask_images)):
     print(f"Fold {fold + 1}/{k}")
 
@@ -210,10 +251,11 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(combined_mask_images)):
 
 # debug
     train_combined_masks_tensor = torch.tensor(train_combined_masks)
+    '''
     print(f"Unique classes in train_combined_masks: {torch.unique(train_combined_masks_tensor)}")
 
     print(f"Shape of train_combined_masks: {train_combined_masks.shape}")
-
+    '''
 # fine debug
 
     train_dataset = CombinedDataset(train_images, train_combined_masks)
@@ -234,11 +276,11 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(combined_mask_images)):
             images_batch, masks_batch = images_batch.to(device), masks_batch.to(device)
             optimizer.zero_grad()
             outputs = lesion_model(images_batch)
-            print(f"Output range before attivation: min={outputs.min().item()}, max={outputs.max().item()}")
+            # print(f"Output range before attivation: min={outputs.min().item()}, max={outputs.max().item()}")
 
             outputs = torch.softmax(outputs, dim=1)
 
-            print(f"Output range after attivation: min={outputs.min().item()}, max={outputs.max().item()}")
+            # print(f"Output range after attivation: min={outputs.min().item()}, max={outputs.max().item()}")
 
             loss = tversky_loss(outputs, masks_batch, class_weights=class_weights)
             loss.backward()
@@ -255,7 +297,7 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(combined_mask_images)):
             for images_batch, masks_batch in val_loader:
                 images_batch, masks_batch = images_batch.to(device), masks_batch.to(device)
 
-                print(f"mask batch 1: {masks_batch.shape}")
+                # print(f"mask batch 1: {masks_batch.shape}")
 
                 outputs = lesion_model(images_batch)
                 probs = torch.softmax(outputs, dim=1)
@@ -271,10 +313,13 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(combined_mask_images)):
                 val_dice += dice_score(outputs, masks_batch)
                 val_iou += iou_score(outputs, masks_batch)
 
-                print(f"mask batch after 2: {masks_batch.shape}")
+                # print(f"mask batch after 2: {masks_batch.shape}")
 
                 loss = tversky_loss(probs, masks_batch, class_weights=class_weights)
                 val_loss += loss.item()
+                # precision, recall, f1 = calculate_metrics(outputs, masks_batch)
+
+                visualize_activations(lesion_model, images_batch)
 
         scheduler.step(val_loss)
 
