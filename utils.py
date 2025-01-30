@@ -12,10 +12,12 @@ import segmentation_models_pytorch as smp
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import random
 
 
 class CombinedLoss(torch.nn.Module):
-    def __init__(self, alpha=0.6, beta=0.4, gamma=2, weight=None):
+    def __init__(self, alpha=0.7, beta=0.3, gamma=2, weight=None):
         super(CombinedLoss, self).__init__()
         self.alpha = alpha
         self.beta = beta
@@ -143,6 +145,7 @@ def calculate_class_weights(loader, num_classes):
 
     total_count = class_counts.sum()
     class_weights = total_count / (class_counts + 1e-6)
+    print(f"class_weights: {class_weights}")
     return class_weights / class_weights.sum()
 
 
@@ -262,3 +265,53 @@ def train_and_validate(image_dir, mask_dir, lesion_types, num_classes, num_epoch
                   f"IoU: {iou_score / len(val_loader):.4f}, AUC: {auc_score / len(val_loader):.4f}")
 
     torch.save(model.state_dict(), 'saved_models/lesion_model_multiclass.pth')
+
+
+def predict(image_dir, mask_dir, lesion_types, num_classes, model_path='saved_models/lesion_model_multiclass.pth'):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = smp.DeepLabV3Plus(
+        encoder_name='resnet50',
+        encoder_weights='imagenet',
+        in_channels=3,
+        classes=num_classes,
+        activation=None
+    ).to(device)
+
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.eval()
+
+    images, masks = preprocess_data(image_dir, mask_dir, lesion_types)
+
+    idx = random.randint(0, len(images) - 1)
+    image = images[idx]
+    true_mask = masks[idx]
+
+    augmentations = A.Compose([
+        A.Normalize(),
+        ToTensorV2(),
+    ])
+    augmented = augmentations(image=image.astype(np.float32))
+    image_tensor = augmented['image'].unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        output = model(image_tensor)
+        pred_mask = torch.argmax(output, dim=1).squeeze().cpu().numpy()
+
+    plt.figure(figsize=(15, 5))
+
+    plt.subplot(1, 3, 1)
+    plt.title("Immagine Originale")
+    plt.imshow(image)
+    plt.axis('off')
+
+    plt.subplot(1, 3, 2)
+    plt.title("Maschera Vera")
+    plt.imshow(true_mask, cmap='jet')
+    plt.axis('off')
+
+    plt.subplot(1, 3, 3)
+    plt.title("Maschera Predetta")
+    plt.imshow(pred_mask, cmap='jet')
+    plt.axis('off')
+
+    plt.show()
