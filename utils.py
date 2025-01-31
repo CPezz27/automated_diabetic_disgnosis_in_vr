@@ -215,7 +215,7 @@ def train_and_validate(image_dir, mask_dir, lesion_types, num_classes, num_epoch
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
 
     class_weights = torch.tensor([1.0] * num_classes).to(device)
-    loss_fn = DiceFocalLoss()
+    loss_fn = DiceFocalLoss(class_weights=class_weights)
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(images)):
         print(f"Fold {fold + 1}/{5}")
@@ -235,7 +235,7 @@ def train_and_validate(image_dir, mask_dir, lesion_types, num_classes, num_epoch
                 masks_batch = masks_batch.to(torch.long).to(device)
                 optimizer.zero_grad()
                 outputs = model(images_batch)
-                loss = loss_fn(outputs, masks_batch, class_weights)
+                loss = loss_fn(outputs, masks_batch)
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item()
@@ -248,7 +248,7 @@ def train_and_validate(image_dir, mask_dir, lesion_types, num_classes, num_epoch
                     images_batch = images_batch.to(torch.float32).to(device)
                     masks_batch = masks_batch.to(torch.long).to(device)
                     outputs = model(images_batch)
-                    loss = loss_fn(outputs, masks_batch, class_weights)
+                    loss = loss_fn(outputs, masks_batch)
                     val_loss += loss.item()
 
                     y_pred = torch.softmax(outputs, dim=1).cpu().numpy()
