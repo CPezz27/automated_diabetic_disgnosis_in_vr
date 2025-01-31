@@ -16,18 +16,33 @@ import matplotlib.pyplot as plt
 import random
 
 
-class CombinedLoss(torch.nn.Module):
-    def __init__(self, alpha=0.7, beta=0.3, gamma=2, weight=None):
-        super(CombinedLoss, self).__init__()
+class DiceFocalLoss(torch.nn.Module):
+    def __init__(self, alpha=0.8, gamma=2, class_weights=None):
+        super(DiceFocalLoss, self).__init__()
         self.alpha = alpha
-        self.beta = beta
         self.gamma = gamma
-        self.weight = weight
+        self.class_weights = class_weights
 
     def forward(self, y_pred, y_true):
-        tversky = tversky_loss(y_pred, y_true, self.alpha, self.beta, class_weights=self.weight)
-        focal = torch.nn.functional.cross_entropy(y_pred, y_true, weight=self.weight)
-        return 0.5 * tversky + 0.5 * focal
+        smooth = 1e-6
+        y_pred = torch.softmax(y_pred, dim=1)
+        y_true_one_hot = F.one_hot(y_true, num_classes=y_pred.shape[1]).permute(0, 3, 1, 2).float()
+
+        intersection = (y_pred * y_true_one_hot).sum(dim=(2, 3))
+        union = y_pred.sum(dim=(2, 3)) + y_true_one_hot.sum(dim=(2, 3))
+        dice_loss = 1 - (2. * intersection + smooth) / (union + smooth)
+
+        ce_loss = F.cross_entropy(y_pred, y_true, reduction='mean')
+        focal_loss = (1 - torch.exp(-ce_loss)) ** self.gamma * ce_loss
+
+        return self.alpha * dice_loss.mean() + (1 - self.alpha) * focal_loss.mean()
+
+
+def refine_mask_morphology(mask, kernel_size=3):
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    refined_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_OPEN, kernel)
+    return refined_mask
 
 
 class MultiClassDataset(Dataset):
@@ -188,30 +203,28 @@ def train_and_validate(image_dir, mask_dir, lesion_types, num_classes, num_epoch
     images, masks = preprocess_data(image_dir, mask_dir, lesion_types)
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
-    model = smp.DeepLabV3Plus(
-        encoder_name='resnet50',
-        encoder_weights='imagenet',
+    model = smp.Unet(
+        encoder_name="timm-efficientnet-b4",
+        encoder_weights="imagenet",
         in_channels=3,
         classes=num_classes,
-        activation=None
+        decoder_attention_type="scse"
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
 
+    class_weights = torch.tensor([1.0] * num_classes).to(device)
+    loss_fn = DiceFocalLoss()
+
     for fold, (train_idx, val_idx) in enumerate(kf.split(images)):
         print(f"Fold {fold + 1}/{5}")
-
-        # train_images, val_images = images[train_idx], images[val_idx]
-        # train_masks, val_masks = masks[train_idx], masks[val_idx]
 
         train_dataset = MultiClassDataset(images[train_idx], masks[train_idx], augmentations=augmentations)
         val_dataset = MultiClassDataset(images[val_idx], masks[val_idx], augmentations=augmentations)
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
-        class_weights = calculate_class_weights(train_loader, num_classes).to(device)
 
         for epoch in range(num_epochs):
             model.train()
@@ -222,7 +235,7 @@ def train_and_validate(image_dir, mask_dir, lesion_types, num_classes, num_epoch
                 masks_batch = masks_batch.to(torch.long).to(device)
                 optimizer.zero_grad()
                 outputs = model(images_batch)
-                loss = combined_loss(outputs, masks_batch, class_weights=class_weights)
+                loss = loss_fn(outputs, masks_batch, class_weights)
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item()
@@ -235,17 +248,13 @@ def train_and_validate(image_dir, mask_dir, lesion_types, num_classes, num_epoch
                     images_batch = images_batch.to(torch.float32).to(device)
                     masks_batch = masks_batch.to(torch.long).to(device)
                     outputs = model(images_batch)
-                    loss = tversky_loss(outputs, masks_batch)
+                    loss = loss_fn(outputs, masks_batch, class_weights)
                     val_loss += loss.item()
 
                     y_pred = torch.softmax(outputs, dim=1).cpu().numpy()
                     # print(f"y_pred prima: {y_pred.shape}") #8, 5, 128, 128
                     y_pred = y_pred.reshape(-1, num_classes)
                     # print(f"y_pred dopo: {y_pred.shape}") #131072, 5
-
-                    # Controlliamo che le probabilità sommino a 1
-                    # print(f"Somma delle probabilità per sample: {np.sum(y_pred, axis=1)}")
-
                     y_true = masks_batch.cpu().numpy().flatten()
                     # print(f"y_true prima:  {y_true.shape}") #131072
 
@@ -269,12 +278,12 @@ def train_and_validate(image_dir, mask_dir, lesion_types, num_classes, num_epoch
 
 def predict(image_dir, mask_dir, lesion_types, num_classes, model_path='saved_models/lesion_model_multiclass.pth'):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = smp.DeepLabV3Plus(
-        encoder_name='resnet50',
-        encoder_weights='imagenet',
+    model = smp.Unet(
+        encoder_name="timm-efficientnet-b4",
+        encoder_weights="imagenet",
         in_channels=3,
         classes=num_classes,
-        activation=None
+        decoder_attention_type="scse"
     ).to(device)
 
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
