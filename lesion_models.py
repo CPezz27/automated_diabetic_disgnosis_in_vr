@@ -14,5 +14,5 @@ num_classes_cls = 5
 num_epochs = 10
 batch_size = 8
 
-train_and_validate(image_dir, mask_dir, csv_path, lesion_types, num_classes_seg, num_classes_cls, num_epochs,
-                   batch_size)
+check_data_balance_classification(csv_path, num_classes=5)
+check_data_balance_segmentation(mask_dir, lesion_types)

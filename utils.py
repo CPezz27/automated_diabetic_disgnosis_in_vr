@@ -2,20 +2,30 @@ import os
 import numpy as np
 import cv2
 import torch
-import albumentations as A
+import albumentations as a
 import segmentation_models_pytorch as smp
 import torch.optim as optim
-import torch.nn.functional as F
+import torch.nn.functional as f
 import matplotlib.pyplot as plt
 import random
 import pandas as pd
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from albumentations.pytorch import ToTensorV2
 from sklearn.model_selection import KFold, train_test_split
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import label_binarize
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from sklearn.preprocessing import OneHotEncoder
+
+
+augmentations = a.Compose([
+    a.HorizontalFlip(p=0.5),
+    a.VerticalFlip(p=0.5),
+    a.Rotate(limit=30, p=0.5),
+    a.RandomBrightnessContrast(p=0.2),
+    a.GaussNoise(p=0.5),
+    a.RandomResizedCrop(size=(128, 128), scale=(0.8, 0.8), p=0.5),
+    ToTensorV2(),
+])
 
 
 class DiceFocalLoss(torch.nn.Module):
@@ -28,13 +38,15 @@ class DiceFocalLoss(torch.nn.Module):
     def forward(self, y_pred, y_true):
         smooth = 1e-6
         y_pred = torch.softmax(y_pred, dim=1)
-        y_true_one_hot = F.one_hot(y_true, num_classes=y_pred.shape[1]).permute(0, 3, 1, 2).float()
+        y_true_one_hot = f.one_hot(y_true, num_classes=y_pred.shape[1]).permute(0, 3, 1, 2).float()
 
         intersection = (y_pred * y_true_one_hot).sum(dim=(2, 3))
         union = y_pred.sum(dim=(2, 3)) + y_true_one_hot.sum(dim=(2, 3))
         dice_loss = 1 - (2. * intersection + smooth) / (union + smooth)
 
-        ce_loss = F.cross_entropy(y_pred, y_true, reduction='mean')
+        ce_loss = f.cross_entropy(y_pred, y_true, reduction='mean')
+        if self.class_weights is not None:
+            ce_loss = ce_loss * self.class_weights[y_true]
         focal_loss = (1 - torch.exp(-ce_loss)) ** self.gamma * ce_loss
 
         return self.alpha * dice_loss.mean() + (1 - self.alpha) * focal_loss.mean()
@@ -60,20 +72,11 @@ class MultiClassDataset(Dataset):
         return image, mask
 
 
-augmentations = A.Compose([
-    A.HorizontalFlip(p=0.5),
-    A.VerticalFlip(p=0.5),
-    A.Rotate(limit=45, p=0.5),
-    A.RandomBrightnessContrast(p=0.2),
-    A.ElasticTransform(p=0.3),
-    A.CoarseDropout(p=0.3),
-    A.GaussianBlur(p=0.2),
-    A.CLAHE(p=0.2),
-    A.Normalize(),
-    A.GridDistortion(),
-    A.OpticalDistortion(),
-    ToTensorV2(),
-])
+def get_sampler(labels, num_classes):
+    class_weights = classification_class_weights(labels, num_classes)
+    sample_weights = [class_weights[label] for label in labels]
+    sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
+    return sampler
 
 
 def read_dr_severity_labels(csv_path):
@@ -81,6 +84,15 @@ def read_dr_severity_labels(csv_path):
     image_names = df['Image name'].values
     labels = df['Retinopathy grade'].values
     return image_names, labels
+
+
+def load_classification_labels(csv_path, num_classes):
+    df = pd.read_csv(csv_path)
+    image_names = df['Image name'].values
+    labels = df['Retinopathy grade'].values
+    one_hot_labels = label_binarize(labels, classes=range(num_classes))
+
+    return {image_names[i]: one_hot_labels[i] for i in range(len(image_names))}
 
 
 def refine_mask_morphology(mask, kernel_size=3):
@@ -127,7 +139,41 @@ def iou_score(y_pred, y_true, smooth=1e-6):
     return iou.mean().item()
 
 
-def calculate_class_weights(loader, num_classes):
+def check_data_balance_classification(csv_path, num_classes):
+    df = pd.read_csv(csv_path)
+    class_counts = df['Retinopathy grade'].value_counts().sort_index()
+
+    print("Class distribution for classification:")
+    for i in range(num_classes):
+        print(f"Severity {i}: {class_counts.get(i, 0)} samples")
+
+
+def check_data_balance_segmentation(mask_dir, lesion_types, target_size=(128, 128)):
+    lesion_pixel_counts = {lesion: 0 for lesion in lesion_types}
+
+    for filename in os.listdir(mask_dir):
+        mask_path = os.path.join(mask_dir, filename)
+        if os.path.exists(mask_path):
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            mask = cv2.resize(mask, target_size)
+
+            for lesion_type in lesion_types:
+                if lesion_type in filename:
+                    lesion_pixel_counts[lesion_type] += np.sum(mask > 0)
+
+    print("Pixel distribution for segmentation:")
+    for lesion, count in lesion_pixel_counts.items():
+        print(f"{lesion}: {count} pixels")
+
+
+def classification_class_weights(labels, num_classes):
+    class_counts = np.bincount(labels, minlength=num_classes)
+    total_count = len(labels)
+    class_weights = total_count / (class_counts + 1e-6)
+    return class_weights / class_weights.sum()
+
+
+def segmentation_class_weights(loader, num_classes):
     class_counts = torch.zeros(num_classes, dtype=torch.float32)
 
     for _, masks_batch in loader:
@@ -272,8 +318,8 @@ def predict(image_dir, mask_dir, lesion_types, num_classes, model_path='saved_mo
     image = images[idx]
     true_mask = masks[idx]
 
-    augmentations = A.Compose([
-        A.Normalize(),
+    augmentations = a.Compose([
+        a.Normalize(),
         ToTensorV2(),
     ])
     augmented = augmentations(image=image.astype(np.float32))
