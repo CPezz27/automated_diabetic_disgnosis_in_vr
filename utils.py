@@ -2,18 +2,20 @@ import os
 import numpy as np
 import cv2
 import torch
-from torch.utils.data import Dataset, DataLoader
 import albumentations as A
-from albumentations.pytorch import ToTensorV2
-from sklearn.model_selection import KFold
-from sklearn.metrics import roc_auc_score
-from sklearn.preprocessing import label_binarize
 import segmentation_models_pytorch as smp
 import torch.optim as optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import random
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from albumentations.pytorch import ToTensorV2
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import label_binarize
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.preprocessing import OneHotEncoder
 
 
 class DiceFocalLoss(torch.nn.Module):
@@ -36,13 +38,6 @@ class DiceFocalLoss(torch.nn.Module):
         focal_loss = (1 - torch.exp(-ce_loss)) ** self.gamma * ce_loss
 
         return self.alpha * dice_loss.mean() + (1 - self.alpha) * focal_loss.mean()
-
-
-def refine_mask_morphology(mask, kernel_size=3):
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    refined_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_OPEN, kernel)
-    return refined_mask
 
 
 class MultiClassDataset(Dataset):
@@ -81,44 +76,26 @@ augmentations = A.Compose([
 ])
 
 
-def tversky_loss(y_pred, y_true, alpha=0.6, beta=0.4, smooth=1e-6, class_weights=None):
-    y_pred = torch.softmax(y_pred, dim=1)
-    y_true_one_hot = F.one_hot(y_true, num_classes=y_pred.size(1)).permute(0, 3, 1, 2).float()
-
-    true_pos = torch.sum(y_pred * y_true_one_hot, dim=(2, 3))
-    false_neg = torch.sum(y_true_one_hot * (1 - y_pred), dim=(2, 3))
-    false_pos = torch.sum((1 - y_true_one_hot) * y_pred, dim=(2, 3))
-
-    tversky_index = (true_pos + smooth) / (true_pos + alpha * false_neg + beta * false_pos + smooth)
-
-    if class_weights is not None:
-        tversky_index *= class_weights
-
-    return 1 - tversky_index.mean()
+def read_dr_severity_labels(csv_path):
+    df = pd.read_csv(csv_path)
+    image_names = df['Image name'].values
+    labels = df['Retinopathy grade'].values
+    return image_names, labels
 
 
-def dice_score(y_pred, y_true, smooth=1e-6):
-    y_true = (y_true > 0.5).float()
-
-    intersection = (y_pred * y_true).sum(dim=(2, 3))
-    union = y_pred.sum(dim=(2, 3)) + y_true.sum(dim=(2, 3))
-    dice = (2.0 * intersection + smooth) / (union + smooth)
-
-    return dice.mean().item()
+def refine_mask_morphology(mask, kernel_size=3):
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    refined_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_OPEN, kernel)
+    return refined_mask
 
 
-def combined_loss(y_pred, y_true, alpha=0.6, beta=0.4, gamma=0.5, class_weights=None):
-    tversky = tversky_loss(y_pred, y_true, alpha, beta, class_weights=class_weights)
-    ce_loss = F.cross_entropy(y_pred, y_true, weight=class_weights)
-    return gamma * tversky + (1 - gamma) * ce_loss
+def one_hot_encode_labels(labels, num_classes):
+    return label_binarize(labels, classes=range(num_classes))
 
 
-def post_process_mask(mask, threshold=0.5):
-    mask = (mask > threshold).astype(np.uint8)
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    return mask
+def split_data(image_names, labels, test_size=0.2, random_state=42):
+    return train_test_split(image_names, labels, test_size=test_size, random_state=random_state)
 
 
 def calculate_metrics(predictions, targets, num_classes):
@@ -197,7 +174,7 @@ def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
     return np.array(images), np.array(masks)
 
 
-def train_and_validate(image_dir, mask_dir, lesion_types, num_classes, num_epochs, batch_size):
+def train_segmentation_model(image_dir, mask_dir, lesion_types, num_classes, num_epochs, batch_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     images, masks = preprocess_data(image_dir, mask_dir, lesion_types)
