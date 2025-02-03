@@ -20,6 +20,7 @@ from torchvision import transforms
 import torch.nn as nn
 from sklearn.preprocessing import LabelEncoder
 from efficientnet_pytorch import EfficientNet
+from random import randint
 
 
 def augmentations():
@@ -336,7 +337,6 @@ def classification_model(image_dir, num_classes, num_epochs, batch_size, csv_pat
             train_loss += loss.item()
             train_acc += calculate_accuracy(outputs, labels)
 
-
         val_loss, val_acc = 0, 0
         model.eval()
 
@@ -355,14 +355,15 @@ def classification_model(image_dir, num_classes, num_epochs, batch_size, csv_pat
               f"Train Loss: {train_loss / len(train_loader):.4f}, Train Acc: {train_acc / len(train_loader):.4f}, "
               f"Val Loss: {val_loss / len(val_loader):.4f}, Val Acc: {val_acc / len(val_loader):.4f}")
 
-        torch.save(model.state_dict(), "efficientnet_fundus_classification.pth")
+    torch.save(model.state_dict(), "efficientnet_fundus_classification.pth")
 
 
-def predict(image_dir, mask_dir, lesion_types, num_classes, model_path='saved_models/lesion_model_multiclass.pth'):
+def predict_segmentation(image_dir, mask_dir, lesion_types, num_classes,
+                         model_path='saved_models/lesion_model_multiclass.pth'):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = smp.Unet(
         encoder_name="timm-efficientnet-b4",
-        encoder_weights="imagenet",
+        encoder_weights=None,
         in_channels=3,
         classes=num_classes,
         decoder_attention_type="scse"
@@ -406,3 +407,41 @@ def predict(image_dir, mask_dir, lesion_types, num_classes, model_path='saved_mo
     plt.axis('off')
 
     plt.show()
+
+
+def predict_classification(image_dir, num_classes, model_path='efficientnet_fundus_classification.pth'):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    i=0
+
+    model = EfficientNet.from_name("efficientnet-b0", num_classes=num_classes).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.eval()
+
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    image_files = [f for f in os.listdir(image_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
+    for x in image_files:
+        i += 1
+
+    if not image_files:
+        raise ValueError("No images found in the directory.")
+
+    idx = randint(1, i)
+
+    image_path = os.path.join(image_dir, image_files[idx])
+
+    print(image_path)
+
+    image = Image.open(image_path).convert("RGB")
+    image = transform(image).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        output = model(image)
+
+    predicted_class = torch.argmax(output, dim=1).item()
+
+    return predicted_class

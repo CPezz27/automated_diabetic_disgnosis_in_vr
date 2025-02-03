@@ -10,14 +10,13 @@ csv_path = 'dataset/IDRiD/DiseaseGrading/Groundtruths/a. IDRiD_Disease Grading_T
 lesion_types = ["EX", "MA", "HE", "SE"]
 
 num_classes = 5
-num_epochs = 10
+num_epochs = 100
 batch_size = 8
 
 rare_classes = ['MA', 'SE']
 
-# check_data_balance_classification(csv_path, num_classes=5)
-# check_data_balance_segmentation(mask_dir, lesion_types)
 
-# segmentation_model(image_dir, mask_dir, lesion_types, num_epochs, batch_size, rare_classes)
-# predict(image_dir, mask_dir, lesion_types, len(lesion_types))
+segmentation_model(image_dir, mask_dir, lesion_types, num_epochs, batch_size, rare_classes)
 classification_model(image_dir_classification, num_classes, num_epochs, batch_size, csv_path)
+
+
