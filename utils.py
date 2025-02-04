@@ -9,6 +9,11 @@ import torch.nn.functional as f
 import matplotlib.pyplot as plt
 import random
 import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.preprocessing import image
+from tensorflow.keras.applications.vgg16 import preprocess_input, decode_predictions
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from albumentations.pytorch import ToTensorV2
@@ -336,7 +341,7 @@ def classification_accuracy(outputs, labels):
 
 
 def classification_model(
-        num_classes, num_epochs, batch_size, image_dir='dataset/IDRiD/train/images',
+        num_classes, num_epochs, batch_size, image_dir='dataset/IDRiD/DiseaseGrading/OriginalImages/a. Training Set',
         csv_path='dataset/IDRiD/DiseaseGrading/Groundtruths/a. IDRiD_Disease Grading_Training Labels.csv'):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -553,63 +558,38 @@ def predict_classification(image_dir, num_classes, model_path='efficientnet_fund
     return predicted_class
 
 
-def train_classification_with_segmentation(num_classes, num_epochs, batch_size, image_dir, mask_dir, csv_path):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    data = pd.read_csv(csv_path)
-    label_encoder = LabelEncoder()
-    data['Retinopathy grade'] = label_encoder.fit_transform(data['Retinopathy grade'])
+def preprocess_grad(img_path):
+    img = image.load_img(img_path, target_size=(224, 224))
+    img_array = image.img_to_array(img)
+    img_array = np.expand_dims(img_array, axis=0)
+    return preprocess_input(img_array)
 
-    train_data, val_data = train_test_split(data, test_size=0.2, random_state=42, shuffle=True)
 
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(45),
-        transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.2),
-        transforms.RandomAffine(degrees=0, translate=(0.2, 0.2)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name):
+    grad_model = tf.keras.models.Model(
+        [model.inputs], [model.get_layer(last_conv_layer_name).output, model.output]
+    )
 
-    train_dataset = FundusSegmentationDataset(train_data, image_dir, mask_dir, transform=transform)
-    val_dataset = FundusSegmentationDataset(val_data, image_dir, mask_dir, transform=transform)
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        class_idx = tf.argmax(predictions[0])
+        loss = predictions[:, class_idx]
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    grads = tape.gradient(loss, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_outputs = conv_outputs[0]
+    heatmap = tf.reduce_mean(tf.multiply(pooled_grads, conv_outputs), axis=-1)
+    heatmap = np.maximum(heatmap, 0)
+    heatmap /= np.max(heatmap) if np.max(heatmap) != 0 else 1
+    return heatmap.numpy()
 
-    model = ClassificationWithSegmentation(num_classes).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-3)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 
-    for epoch in range(num_epochs):
-        model.train()
-        train_loss, train_acc = 0, 0
-
-        for images, masks, labels in train_loader:
-            images, masks, labels = images.to(device), masks.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(images, masks)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item
-            train_acc += classification_accuracy(outputs, labels)
-
-            val_loss, val_acc = 0, 0
-            model.eval()
-            with torch.no_grad():
-                for images, masks, labels in val_loader:
-                    images, masks, labels = images.to(device), masks.to(device), labels.to(device)
-                    outputs = model(images, masks)
-                    loss = criterion(outputs, labels)
-                    val_loss += loss.item()
-                    val_acc += classification_accuracy(outputs, labels)
-
-            scheduler.step(val_loss)
-            print(f"Epoch [{epoch + 1}/{num_epochs}], Train Loss: {train_loss / len(train_loader):.4f}, "
-                  f"Train Acc: {train_acc / len(train_loader):.4f}, Val Loss: {val_loss / len(val_loader):.4f}, "
-                  f"Val Acc: {val_acc / len(val_loader):.4f}")
-
-        torch.save(model.state_dict(), "saved_models/classification_with_segmentation.pth")
+def overlay_heatmap(img_path, heatmap, alpha=0.4):
+    img = cv2.imread(img_path)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # Converti l'immagine in RGB
+    img = cv2.resize(img, (224, 224))
+    heatmap = cv2.resize(heatmap, (224, 224))
+    heatmap = np.uint8(255 * heatmap)
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    superimposed_img = cv2.addWeighted(heatmap, alpha, img, 1 - alpha, 0)
+    return superimposed_img
