@@ -10,8 +10,6 @@ import matplotlib.pyplot as plt
 import random
 import pandas as pd
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras.applications import VGG16
 from tensorflow.keras.preprocessing import image
 from tensorflow.keras.applications.vgg16 import preprocess_input, decode_predictions
 from PIL import Image
@@ -27,6 +25,7 @@ import torch.nn as nn
 from sklearn.preprocessing import LabelEncoder
 from efficientnet_pytorch import EfficientNet
 from random import randint
+from torchcam.methods import GradCAM
 
 
 def augmentations():
@@ -562,34 +561,102 @@ def preprocess_grad(img_path):
     img = image.load_img(img_path, target_size=(224, 224))
     img_array = image.img_to_array(img)
     img_array = np.expand_dims(img_array, axis=0)
-    return preprocess_input(img_array)
+    preprocess_input(img_array)
+
+    img_tensor = torch.tensor(img_array).float()
+    img_tensor = img_tensor.permute(0, 3, 1, 2)
+    return img_tensor
 
 
-def make_gradcam_heatmap(img_array, model, last_conv_layer_name):
+def load_classification_model(weights_path="best_model.pth", num_classes=5, device="cuda"):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    map_location = torch.device(device if torch.cuda.is_available() else "cpu")
+
+    model = EfficientNet.from_pretrained('efficientnet-b4', num_classes=num_classes)
+
+    model._fc = nn.Sequential(
+        nn.Dropout(0.5),
+        nn.Linear(model._fc.in_features, 512),
+        nn.ReLU(),
+        nn.Dropout(0.5),
+        nn.Linear(512, num_classes)
+    )
+
+    model.load_state_dict(torch.load(weights_path, map_location=map_location))
+    model.to(map_location)
+    model.eval()
+
+    print(model)
+
+    return model
+
+
+def apply_grad_cam(image, device="cuda", weights_path="best_model.pth"):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = load_classification_model(weights_path, device=device)
+    model.eval()
+
+    cam_extractor = GradCAM(model, target_layer="conv2d_2")
+    image = image.to(device).unsqueeze(0)
+    output = model(image)
+    predicted_class = output.argmax().item()
+
+    activation_map = cam_extractor(predicted_class, output)
+    activation_map = activation_map.squeeze().cpu().detach().numpy()
+    activation_map = cv2.resize(activation_map, (224, 224))
+    activation_map = (activation_map - activation_map.min()) / (activation_map.max() - activation_map.min())
+
+    image_np = image.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    image_np = (image_np - image_np.min()) / (image_np.max() - image_np.min())
+
+    heatmap = cv2.applyColorMap(np.uint8(255 * activation_map), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+    overlayed_img = (0.4 * heatmap / 255 + 0.6 * image_np)
+
+    plt.figure(figsize=(6, 6))
+    plt.imshow(overlayed_img)
+    plt.axis('off')
+    plt.title(f"Grad-CAM per classe predetta: {predicted_class}")
+    plt.show()
+
+
+def grad_cam(model, image, class_index, layer_name="conv2d_2"):
+
     grad_model = tf.keras.models.Model(
-        [model.inputs], [model.get_layer(last_conv_layer_name).output, model.output]
+        [model.inputs],
+        [model.get_layer(layer_name).output, model.output]
     )
 
     with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model(img_array)
-        class_idx = tf.argmax(predictions[0])
-        loss = predictions[:, class_idx]
+        conv_output, predictions = grad_model(np.expand_dims(image, axis=0))
+        loss = predictions[:, class_index]
 
-    grads = tape.gradient(loss, conv_outputs)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    conv_outputs = conv_outputs[0]
-    heatmap = tf.reduce_mean(tf.multiply(pooled_grads, conv_outputs), axis=-1)
+    grads = tape.gradient(loss, conv_output)
+    pooled_grads = K.mean(grads, axis=(0, 1, 2))
+    conv_output = conv_output[0]
+    pooled_grads = tf.expand_dims(tf.expand_dims(pooled_grads, 0), 0)
+    weighted_conv_output = conv_output * pooled_grads
+    heatmap = tf.reduce_mean(weighted_conv_output, axis=-1)
     heatmap = np.maximum(heatmap, 0)
-    heatmap /= np.max(heatmap) if np.max(heatmap) != 0 else 1
-    return heatmap.numpy()
+    heatmap /= np.max(heatmap)
+
+    return heatmap
 
 
-def overlay_heatmap(img_path, heatmap, alpha=0.4):
-    img = cv2.imread(img_path)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # Converti l'immagine in RGB
-    img = cv2.resize(img, (224, 224))
-    heatmap = cv2.resize(heatmap, (224, 224))
+def overlay_grad_cam(heatmap, original_image, alpha=0.4):
+    heatmap = cv2.resize(heatmap, (original_image.shape[1], original_image.shape[0]))
     heatmap = np.uint8(255 * heatmap)
-    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-    superimposed_img = cv2.addWeighted(heatmap, alpha, img, 1 - alpha, 0)
-    return superimposed_img
+    heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+
+    if original_image.shape[-1] == 4:
+        alpha_channel = np.ones_like(heatmap_color[..., 0]) * 255
+        heatmap_color = np.dstack([heatmap_color, alpha_channel])
+    elif original_image.shape[-1] == 3 and heatmap_color.shape[-1] == 4:
+        heatmap_color = heatmap[..., :3]
+
+    overlay = cv2.addWeighted(original_image, 1 - alpha, heatmap_color, alpha, 0)
+    return overlay
