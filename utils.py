@@ -25,7 +25,7 @@ import torch.nn as nn
 from sklearn.preprocessing import LabelEncoder
 from efficientnet_pytorch import EfficientNet
 from random import randint
-from torchcam.methods import GradCAM
+from tensorflow.keras.models import Model
 
 
 def augmentations():
@@ -320,7 +320,7 @@ def segmentation_model(num_epochs, batch_size, image_dir='dataset/IDRiD/train/im
                   f"IoU: {iou_score / len(val_loader):.4f}, AUC: {auc_score / len(val_loader):.4f}, "
                   f"Accuracy: {accuracy / len(val_loader):.4f}")
 
-    torch.save(model.state_dict(), 'saved_models/lesion_model_binary.pth')
+    torch.save(model, 'saved_models/lesion_model_binary.pth')
 
 
 def classification_metrics(outputs, labels):
@@ -457,7 +457,7 @@ def classification_model(
               f"Val Precision: {val_precision / len(val_loader):.4f}, Val Recall: {val_recall / len(val_loader):.4f}, "
               f"Val F1: {val_f1 / len(val_loader):.4f}")
 
-    torch.save(model.state_dict(), "saved_models/efficientnet_fundus_classification.pth")
+    torch.save(model, "saved_models/efficientnet_fundus_classification.pth")
 
 
 def predict_segmentation(lesion_mapping, image_dir='dataset/IDRiD/test/images', mask_dir='dataset/IDRiD/test/masks',
@@ -593,58 +593,72 @@ def load_classification_model(weights_path="best_model.pth", num_classes=5, devi
     return model
 
 
-def apply_grad_cam(image, device="cuda", weights_path="best_model.pth"):
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    model = load_classification_model(weights_path, device=device)
+def grad_cam(model, image, layer_name):
     model.eval()
+    gradients = []
+    activations = []
 
-    cam_extractor = GradCAM(model, target_layer="conv2d_2")
-    image = image.to(device).unsqueeze(0)
+    def hook_function(module, grad_in, grad_out):
+        gradients.append(grad_out[0])
+
+    def forward_hook_function(module, inp, out):
+        activations.append(out)
+
+    layer = dict([*model.named_modules()])[layer_name]
+    forward_hook = layer.register_forward_hook(forward_hook_function)
+    backward_hook = layer.register_backward_hook(hook_function)
+
     output = model(image)
-    predicted_class = output.argmax().item()
+    class_idx = output.argmax(dim=1).item()
+    model.zero_grad()
+    output[:, class_idx].backward()
 
-    activation_map = cam_extractor(predicted_class, output)
-    activation_map = activation_map.squeeze().cpu().detach().numpy()
-    activation_map = cv2.resize(activation_map, (224, 224))
-    activation_map = (activation_map - activation_map.min()) / (activation_map.max() - activation_map.min())
+    grad = gradients[0].cpu().data.numpy()[0]
+    act = activations[0].cpu().data.numpy()[0]
 
-    image_np = image.squeeze(0).permute(1, 2, 0).cpu().numpy()
-    image_np = (image_np - image_np.min()) / (image_np.max() - image_np.min())
+    weights = np.mean(grad, axis=(1, 2))
+    cam = np.sum(weights[:, np.newaxis, np.newaxis] * act, axis=0)
+    cam = np.maximum(cam, 0)
+    cam = cv2.resize(cam, (image.shape[-1], image.shape[-2]))
+    cam = cam - np.min(cam)
+    cam = cam / np.max(cam)
 
-    heatmap = cv2.applyColorMap(np.uint8(255 * activation_map), cv2.COLORMAP_JET)
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-    overlayed_img = (0.4 * heatmap / 255 + 0.6 * image_np)
+    forward_hook.remove()
+    backward_hook.remove()
 
-    plt.figure(figsize=(6, 6))
-    plt.imshow(overlayed_img)
+    return cam
+
+
+def superimpose_heatmap(img_path, heatmap, alpha=0.4):
+    img = cv2.imread(img_path)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    heatmap = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
+    heatmap = np.uint8(255 * heatmap)
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    superimposed_img = cv2.addWeighted(img, 1 - alpha, heatmap, alpha, 0)
+    return superimposed_img
+
+
+def visualize_grad_cam(model, img_path, preprocess_fn, target_layer='_conv_head'):
+    img = cv2.imread(img_path)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    transform = preprocess_fn
+    img_tensor = transform(img).unsqueeze(0)
+
+    heatmap = grad_cam(model, img_tensor, target_layer)
+    superimposed_img = superimpose_heatmap(img_path, heatmap)
+
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.imshow(img)
     plt.axis('off')
-    plt.title(f"Grad-CAM per classe predetta: {predicted_class}")
+    plt.title("Immagine originale")
+
+    plt.subplot(1, 2, 2)
+    plt.imshow(superimposed_img)
+    plt.axis('off')
+    plt.title("Grad-CAM Overlay")
     plt.show()
-
-
-def grad_cam(model, image, class_index, layer_name="conv2d_2"):
-
-    grad_model = tf.keras.models.Model(
-        [model.inputs],
-        [model.get_layer(layer_name).output, model.output]
-    )
-
-    with tf.GradientTape() as tape:
-        conv_output, predictions = grad_model(np.expand_dims(image, axis=0))
-        loss = predictions[:, class_index]
-
-    grads = tape.gradient(loss, conv_output)
-    pooled_grads = K.mean(grads, axis=(0, 1, 2))
-    conv_output = conv_output[0]
-    pooled_grads = tf.expand_dims(tf.expand_dims(pooled_grads, 0), 0)
-    weighted_conv_output = conv_output * pooled_grads
-    heatmap = tf.reduce_mean(weighted_conv_output, axis=-1)
-    heatmap = np.maximum(heatmap, 0)
-    heatmap /= np.max(heatmap)
-
-    return heatmap
 
 
 def overlay_grad_cam(heatmap, original_image, alpha=0.4):

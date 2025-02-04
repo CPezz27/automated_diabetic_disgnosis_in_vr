@@ -8,7 +8,7 @@ model = VGG16(weights='imagenet')
 mask_dir = 'dataset/IDRiD/train/masks'
 
 num_classes = 5
-num_epochs = 25
+num_epochs = 5
 batch_size = 8
 
 lesion_mapping = {"MA": 1, "HE": 2, "EX": 3, "SE": 4, "OD": 5}
@@ -20,10 +20,7 @@ img_path = img_path_classification+'/IDRiD_001.jpg'
 print(img_path)
 test_img = preprocess_grad(img_path)
 
-# segmentation_model(num_epochs, batch_size)
-# classification_model(num_classes, num_epochs, batch_size)
+segmentation_model(num_epochs, batch_size)
+classification_model(num_classes, num_epochs, batch_size)
 
 # predict_segmentation(lesion_mapping)
-
-
-apply_grad_cam(test_img)
