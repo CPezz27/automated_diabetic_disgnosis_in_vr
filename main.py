@@ -48,7 +48,7 @@ class RGBADataGenerator(Sequence):
         return images, labels
 
     def preprocess_image(self, image):
-        image = Image.fromarray((image * 255).astype(np.uint8))  # Convert to PIL
+        image = Image.fromarray((image * 255).astype(np.float32))
         if image.mode != 'RGBA':
             image = image.convert('RGBA')
         return np.array(image) / 255.0

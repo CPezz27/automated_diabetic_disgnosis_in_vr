@@ -89,10 +89,9 @@ class DiceFocalLoss(torch.nn.Module):
 
 
 class MultiClassDataset(Dataset):
-    def __init__(self, inputs, masks, augmentations=None):
+    def __init__(self, inputs, masks):
         self.inputs = inputs
         self.masks = masks
-        self.augmentations = augmentations
 
     def __len__(self):
         return len(self.inputs)
@@ -103,11 +102,8 @@ class MultiClassDataset(Dataset):
 
         image = image / 255.0
 
-        augmented = self.augmentations(image=image.astype(np.float32), mask=mask.astype(np.float32))
-        image, mask = augmented['image'], augmented['mask']
-
-        image = image.clone().detach().to(torch.float32)
-        mask = mask.clone().detach().to(torch.float32)
+        image = torch.tensor(image, dtype=torch.float32)
+        mask = torch.tensor(mask, dtype=torch.float32)
 
         return image, mask
 
@@ -133,8 +129,22 @@ def segmentation_metrics(y_true, y_pred):
     return accuracy, iou, dice, auc
 
 
+def seg_augmented_data(images, masks, num_augmentations=15):
+    augmented_images = []
+    augmented_masks = []
+    augment_fn = augmentations()
+
+    for image, mask in zip(images, masks):
+        for _ in range(num_augmentations):
+            augmented = augment_fn(image=image.astype(np.uint8), mask=mask.astype(np.uint8))
+            augmented_images.append(augmented['image'])
+            augmented_masks.append(augmented['mask'])
+
+    return np.array(augmented_images), np.array(augmented_masks)
+
+
 def calculate_class_weights(masks):
-    class_counts = np.bincount(masks.flatten())
+    class_counts = np.bincount(masks.flatten().astype(int))
     frequency = class_counts/np.sum(class_counts)
     class_weights = 1.0 / frequency
     class_weights = class_weights/np.sum(class_weights)
@@ -149,6 +159,7 @@ def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
         img_path = os.path.join(image_dir, filename)
         img = cv2.imread(img_path)
         img = cv2.resize(img, target_size) / 255.0
+        img = img.astype(np.float32)
         images.append(img)
 
         binary_mask = np.zeros(target_size, dtype=np.uint8)
@@ -163,9 +174,18 @@ def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
                 mask = (mask > 0).astype(np.uint8)
                 binary_mask = np.maximum(binary_mask, mask)
 
-        masks.append(binary_mask)
+        masks.append(binary_mask.astype(np.float32))
 
     return np.array(images), np.array(masks)
+
+
+'''model = smp.Unet(
+            encoder_name="timm-efficientnet-b4",
+            encoder_weights="imagenet",
+            in_channels=3,
+            classes=num_classes,
+            decoder_attention_type="scse"
+        ).to(device)'''
 
 
 def segmentation_model(batch_size, num_epochs, image_dir='dataset/IDRiD/train/images',
@@ -174,29 +194,36 @@ def segmentation_model(batch_size, num_epochs, image_dir='dataset/IDRiD/train/im
     lesion_types = {'MA': 1, 'HE': 2, 'EX': 3, 'SE': 4, 'OD': 5}
 
     images, masks = preprocess_data(image_dir, masks_dir, lesion_types)
-    class_weights = calculate_class_weights(masks)
+
+    augmented_images, augmented_masks = seg_augmented_data(images, masks)
+
+    images = images.transpose(0, 3, 1, 2)
+
+    print(augmented_images.shape)
+    print(augmented_masks.shape)
+    print(images.shape)
+    print(masks.shape)
+
+    all_images = np.concatenate([images, augmented_images])
+    all_masks = np.concatenate([masks, augmented_masks])
+
+    class_weights = calculate_class_weights(all_masks)
 
     print(f"class_weights: {class_weights}")
 
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
-    for fold, (train_idx, val_idx) in enumerate(kf.split(images)):
-        print(f"Fold {fold + 1}/{5}")
-        print(f"Train indices: {train_idx}")
-        print(f"Validation indices: {val_idx}")
+    for fold, (train_idx, val_idx) in enumerate(kf.split(all_images)):
+        print(f"Fold {fold + 1}/{kf.n_splits}")
 
-        print(f"train idx: {max(train_idx)}")
-        print(f"val_idx idx: {max(val_idx)}")
-        print(f"val_idx idx: {len(images)}")
+        train_inputs, val_inputs = all_images[train_idx], all_images[val_idx]
+        train_masks, val_masks = all_masks[train_idx], all_masks[val_idx]
 
-        assert max(train_idx) < len(images), "Train indices out of bounds"
-        assert max(val_idx) < len(images), "Validation indices out of bounds"
+        print("train masks: ", len(train_masks))
+        print("val masks: ", len(val_masks))
 
-        train_inputs, val_inputs = images[train_idx], images[val_idx]
-        train_masks, val_masks = masks[train_idx], masks[val_idx]
-
-        train_dataset = MultiClassDataset(train_inputs, train_masks, augmentations=augmentations())
-        val_dataset = MultiClassDataset(val_inputs, val_masks, augmentations=augmentations())
+        train_dataset = MultiClassDataset(train_inputs, train_masks)
+        val_dataset = MultiClassDataset(val_inputs, val_masks)
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -487,7 +514,7 @@ def predict_classification(image_dir, num_classes, model_path='efficientnet_fund
 
 
 def preprocess_grad(img_path):
-    img = image.load_img(img_path, target_size=(224, 224))
+    img = image.load_img(img_path, target_size=(128, 128))
     img_array = image.img_to_array(img)
     img_array = np.expand_dims(img_array, axis=0)
     preprocess_input(img_array)
