@@ -8,8 +8,6 @@ import torch.nn.functional as f
 import matplotlib.pyplot as plt
 import random
 import pandas as pd
-from tensorflow.keras.preprocessing import image
-from tensorflow.keras.applications.vgg16 import preprocess_input, decode_predictions
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from albumentations.pytorch import ToTensorV2
@@ -18,9 +16,8 @@ from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_sco
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchvision import transforms
 import torch.nn as nn
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from efficientnet_pytorch import EfficientNet
-from random import randint
 
 
 def augmentations():
@@ -35,28 +32,98 @@ def augmentations():
     ])
 
 
+def get_transforms():
+    return transforms.Compose([
+        transforms.Resize((128, 128)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(45),
+        transforms.Grayscale(num_output_channels=3), #check
+        transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.2),
+        transforms.RandomAffine(degrees=0, translate=(0.2, 0.2)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+
 class FundusDataset(Dataset):
-    def __init__(self, dataframe, image_dir, transform=None):
-        self.dataframe = dataframe
+    def __init__(self, data, image_dir, tabular_features, transform=None, num_augmentations=5):
+        self.data = data
         self.image_dir = image_dir
+        self.tabular_features = tabular_features
         self.transform = transform
+        self.num_augmentations = num_augmentations
+
+        self.images, self.tabular_data = self.load_and_augment_data()
+
+    def load_and_augment_data(self):
+        images = []
+        tabular_data = []
+
+        for idx, row in self.data.iterrows():
+            img_path = os.path.join(self.image_dir, row['Image name'] + '.jpg')
+            image = cv2.imread(img_path)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = cv2.resize(image, (128, 128))
+            tab_data = self.tabular_features[idx]
+
+            images.append(image)
+            tabular_data.append(tab_data)
+
+        return cls_augmented_data(images, tabular_data, self.num_augmentations)
 
     def __len__(self):
-        return len(self.dataframe)
+        return len(self.images)
 
     def __getitem__(self, idx):
-        img_name = os.path.join(self.image_dir, self.dataframe.iloc[idx, 0])
+        image = self.images[idx]
+        tabular_data = self.tabular_data[idx]
 
-        if not img_name.endswith('.jpg'):
-            img_name += '.jpg'
-
-        image = Image.open(img_name).convert('RGB')
-        label = self.dataframe.iloc[idx, 1]
-
-        if self.transform:
+        if self.transform is not None and not isinstance(image, torch.Tensor):
             image = self.transform(image)
 
-        return image, label
+            if isinstance(image, torch.Tensor):
+                pass
+            else:
+                image = transforms.functional.to_tensor(image)
+
+        image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        tabular_data = torch.tensor(tabular_data, dtype=torch.float32)
+        label = torch.tensor(self.data.iloc[idx]['Retinopathy grade'], dtype=torch.long)
+
+        return image, tabular_data, label
+
+
+class MultiModalModel(nn.Module):
+    def __init__(self, num_tabular_features, num_classes=5):
+        super(MultiModalModel, self).__init__()
+        self.cnn = EfficientNet.from_pretrained('efficientnet-b4')
+        self.cnn._fc = nn.Linear(self.cnn._fc.in_features, 512)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(num_tabular_features, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(512 + 64, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, image, tabular_data):
+        img_features = self.cnn(image)
+
+        tab_features = self.mlp(tabular_data)
+
+        combined = torch.cat((img_features, tab_features), dim=1)
+
+        output = self.classifier(combined)
+
+        return output
 
 
 class DiceFocalLoss(torch.nn.Module):
@@ -129,7 +196,7 @@ def segmentation_metrics(y_true, y_pred):
     return accuracy, iou, dice, auc
 
 
-def seg_augmented_data(images, masks, num_augmentations=15):
+def seg_augmented_data(images, masks, num_augmentations=25):
     augmented_images = []
     augmented_masks = []
     augment_fn = augmentations()
@@ -179,15 +246,6 @@ def preprocess_data(image_dir, mask_dir, lesion_types, target_size=(128, 128)):
     return np.array(images), np.array(masks)
 
 
-'''model = smp.Unet(
-            encoder_name="timm-efficientnet-b4",
-            encoder_weights="imagenet",
-            in_channels=3,
-            classes=num_classes,
-            decoder_attention_type="scse"
-        ).to(device)'''
-
-
 def segmentation_model(batch_size, num_epochs, image_dir='dataset/IDRiD/train/images',
                        masks_dir='dataset/IDRiD/train/masks'):
 
@@ -199,17 +257,10 @@ def segmentation_model(batch_size, num_epochs, image_dir='dataset/IDRiD/train/im
 
     images = images.transpose(0, 3, 1, 2)
 
-    print(augmented_images.shape)
-    print(augmented_masks.shape)
-    print(images.shape)
-    print(masks.shape)
-
     all_images = np.concatenate([images, augmented_images])
     all_masks = np.concatenate([masks, augmented_masks])
 
     class_weights = calculate_class_weights(all_masks)
-
-    print(f"class_weights: {class_weights}")
 
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
@@ -218,9 +269,6 @@ def segmentation_model(batch_size, num_epochs, image_dir='dataset/IDRiD/train/im
 
         train_inputs, val_inputs = all_images[train_idx], all_images[val_idx]
         train_masks, val_masks = all_masks[train_idx], all_masks[val_idx]
-
-        print("train masks: ", len(train_masks))
-        print("val masks: ", len(val_masks))
 
         train_dataset = MultiClassDataset(train_inputs, train_masks)
         val_dataset = MultiClassDataset(val_inputs, val_masks)
@@ -259,9 +307,9 @@ def segmentation_model(batch_size, num_epochs, image_dir='dataset/IDRiD/train/im
                     all_preds.append(torch.sigmoid(outputs) > 0.5)
                     all_labels.append(mask)
 
-            all_preds = torch.cat(all_preds)
-            all_labels = torch.cat(all_labels)
-            accuracy, iou, dice, auc = segmentation_metrics(all_labels, all_preds)
+                all_preds = torch.cat(all_preds)
+                all_labels = torch.cat(all_labels)
+                accuracy, iou, dice, auc = segmentation_metrics(all_labels, all_preds)
 
             print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss / len(train_loader):.4f}, "
                   f"Val Loss: {val_loss / len(val_loader):.4f}, Accuracy: {accuracy:.4f}, "
@@ -281,21 +329,50 @@ def classification_metrics(outputs, labels):
     return precision, recall, f1
 
 
-def classification_accuracy(outputs, labels):
-    _, preds = torch.max(outputs, dim=1)
-    return (preds == labels).float().mean()
+def classification_accuracy(labels, outputs):
+    if outputs.ndim > 1 and outputs.shape[1] > 1:
+        outputs = outputs.argmax(dim=1)
+
+    if labels.ndim > 1 and labels.shape[1] > 1:
+        labels = labels.argmax(dim=1)
+
+    correct = (outputs == labels).sum().item()
+    total = labels.numel()
+
+    return correct / total
+
+
+def cls_augmented_data(images, tabular_data, num_augmentations=25):
+    augmented_images = []
+    augmented_tabular = []
+    augment_fn = get_transforms()
+
+    for image, tab_data in zip(images, tabular_data):
+        image_pil = Image.fromarray(image.astype(np.uint8))
+        augmented_images.append(transforms.ToTensor()(image_pil))
+        augmented_tabular.append(tab_data)
+
+        for _ in range(num_augmentations):
+            augmented = augment_fn(image_pil)
+            augmented_images.append(augmented)
+            augmented_tabular.append(tab_data)
+
+    return torch.stack(augmented_images), np.array(augmented_tabular)
 
 
 def classification_model(
-        num_classes, num_epochs, batch_size, image_dir='dataset/IDRiD/DiseaseGrading/OriginalImages/a. Training Set',
+        batch_size, num_epochs, image_dir='dataset/IDRiD/DiseaseGrading/OriginalImages/a. Training Set',
         csv_path='dataset/IDRiD/DiseaseGrading/Groundtruths/a. IDRiD_Disease Grading_Training Labels.csv'):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     data = pd.read_csv(csv_path)
-
     label_encoder = LabelEncoder()
     data['Retinopathy grade'] = label_encoder.fit_transform(data['Retinopathy grade'])
+    tabular_features = data.drop(columns=['Retinopathy grade', 'Image name', 'Unnamed: 11'])
+    tabular_features = tabular_features.dropna(axis=1, how='all')
+
+    scaler = StandardScaler()
+    tabular_features = scaler.fit_transform(tabular_features)
 
     train_data, val_data = train_test_split(data, test_size=0.2, random_state=42, shuffle=True)
 
@@ -303,67 +380,41 @@ def classification_model(
     class_weights = 1. / class_counts+1e-6
     sample_weights = class_weights[train_data['Retinopathy grade'].values]
 
-    print("class_weights: ", class_weights)
-    print("sample_weights: ", sample_weights)
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+    transform = get_transforms()
 
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True
-    )
+    train_dataset = FundusDataset(train_data, image_dir, tabular_features, transform=transform)
+    val_dataset = FundusDataset(val_data, image_dir, tabular_features, transform=transform)
 
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(45),
-        transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.2),
-        transforms.RandomAffine(degrees=0, translate=(0.2, 0.2)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    train_dataset = FundusDataset(train_data, image_dir, transform=transform)
-    val_dataset = FundusDataset(val_data, image_dir, transform=transform)
+    print("train_dataset len", len(train_dataset))
+    print("val_dataset len", len(val_dataset))
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, shuffle=False)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    model = EfficientNet.from_pretrained(
-        'efficientnet-b4',
-        num_classes=num_classes
-    ).to(device)
-
-    model._fc = nn.Sequential(
-        nn.Dropout(0.5),
-        nn.Linear(model._fc.in_features, 512),
-        nn.ReLU(),
-        nn.Dropout(0.5),
-        nn.Linear(512, num_classes)
-    )
-
+    model = MultiModalModel(num_tabular_features=tabular_features.shape[1]).to(device)
     criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32).to(device))
     optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-3)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 
     best_val_loss = float('inf')
-    patience = 10
-    counter = 0
+    patience, counter = 10, 10
 
     for epoch in range(num_epochs):
         model.train()
         train_loss, train_acc = 0, 0
 
-        for images, labels in train_loader:
-
+        for images, tabular_data, labels in train_loader:
+            images = images.permute(0, 2, 1, 3)
             images = images.to(device)
+            tabular_data = tabular_data.to(device)
             labels = labels.to(device)
-
             optimizer.zero_grad()
-            outputs = model(images)
+            outputs = model(images, tabular_data)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+
             train_loss += loss.item()
             train_acc += classification_accuracy(outputs, labels)
 
@@ -371,11 +422,13 @@ def classification_model(
         model.eval()
 
         with torch.no_grad():
-            for images, labels in val_loader:
+            for images, tabular_data, labels in val_loader:
+                images = images.permute(0, 2, 1, 3)
                 images = images.to(device)
+                tabular_data = tabular_data.to(device)
                 labels = labels.to(device)
 
-                outputs = model(images)
+                outputs = model(images, tabular_data)
                 loss = criterion(outputs, labels)
 
                 val_loss += loss.item()
@@ -386,17 +439,17 @@ def classification_model(
                 val_recall += recall
                 val_f1 += f1
 
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    torch.save(model.state_dict(), "best_model.pth")
-                    counter = 0
-                else:
-                    counter += 1
-                    if counter >= patience:
-                        print("Early stopping triggered")
-                        break
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), "best_classification_model.pth")
+            counter = 0
+        else:
+            counter += 1
+            if counter >= patience:
+                print("Early stopping triggered")
+                break
 
-                scheduler.step(val_loss)
+        scheduler.step(val_loss)
 
         print(f"Epoch [{epoch + 1}/{num_epochs}], "
               f"Train Loss: {train_loss / len(train_loader):.4f}, Train Acc: {train_acc / len(train_loader):.4f}, "
@@ -417,7 +470,7 @@ def predict_segmentation(lesion_mapping, image_dir='dataset/IDRiD/test/images', 
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
 
-    image_files = [f for f in os.listdir(image_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
+    image_files = [x for x in os.listdir(image_dir) if x.endswith(('.png', '.jpg', '.jpeg'))]
     if not image_files:
         print("No images found in the directory.")
         return
@@ -432,8 +485,9 @@ def predict_segmentation(lesion_mapping, image_dir='dataset/IDRiD/test/images', 
     masks = [cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE) for mask_path in mask_paths if os.path.exists(mask_path)]
     true_mask = np.sum(masks, axis=0) if masks else None
 
-    image_tensor = a.Compose([a.Resize(256, 256), a.Normalize(mean=[0.485, 0.456, 0.406],
-                                                              std=[0.229, 0.224, 0.225]), ToTensorV2()])(image=image)['image']
+    image_tensor = a.Compose([a.Resize(256, 256),
+                              a.Normalize(mean=[0.485, 0.456, 0.406],
+                                          std=[0.229, 0.224, 0.225]), ToTensorV2()])(image=image)['image']
     image_tensor = image_tensor.to(torch.float32).to(device).unsqueeze(0)
 
     with torch.no_grad():
@@ -475,158 +529,30 @@ def predict_segmentation(lesion_mapping, image_dir='dataset/IDRiD/test/images', 
     plt.show()
 
 
-def predict_classification(image_dir, num_classes, model_path='efficientnet_fundus_classification.pth'):
+def predict_classification(image_path, csv_path, model_path="saved_models/efficientnet_fundus_classification.pth"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    i = 0
 
-    model = EfficientNet.from_name("efficientnet-b0", num_classes=num_classes).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model = torch.load(model_path, map_location=device)
     model.eval()
 
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    data = pd.read_csv(csv_path)
+    tabular_features = data.drop(columns=['Retinopathy grade', 'Image name', 'Unnamed: 11'], errors='ignore')
+    tabular_features = tabular_features.dropna(axis=1, how='all')
 
-    image_files = [f for f in os.listdir(image_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
-    for x in image_files:
-        i += 1
+    scaler = StandardScaler()
+    tabular_features = scaler.fit_transform(tabular_features)
+    tabular_tensor = torch.tensor(tabular_features, dtype=torch.float32).to(device)
 
-    if not image_files:
-        raise ValueError("No images found in the directory.")
+    transform = get_transforms()
 
-    idx = randint(1, i)
-
-    image_path = os.path.join(image_dir, image_files[idx])
-
-    print(image_path)
-
-    image = Image.open(image_path).convert("RGB")
+    image = Image.open(image_path).convert('RGB')
     image = transform(image).unsqueeze(0).to(device)
 
+    print(f"Image features shape: {image.shape}")
+    print(f"Tabular features shape: {tabular_features.shape}")
+
     with torch.no_grad():
-        output = model(image)
+        output = model(image, tabular_tensor)
+        prediction = torch.argmax(output, dim=1).item()
 
-    predicted_class = torch.argmax(output, dim=1).item()
-
-    return predicted_class
-
-
-def preprocess_grad(img_path):
-    img = image.load_img(img_path, target_size=(128, 128))
-    img_array = image.img_to_array(img)
-    img_array = np.expand_dims(img_array, axis=0)
-    preprocess_input(img_array)
-
-    img_tensor = torch.tensor(img_array).float()
-    img_tensor = img_tensor.permute(0, 3, 1, 2)
-    return img_tensor
-
-
-def load_classification_model(weights_path="best_model.pth", num_classes=5, device="cuda"):
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    map_location = torch.device(device if torch.cuda.is_available() else "cpu")
-
-    model = EfficientNet.from_pretrained('efficientnet-b4', num_classes=num_classes)
-
-    model._fc = nn.Sequential(
-        nn.Dropout(0.5),
-        nn.Linear(model._fc.in_features, 512),
-        nn.ReLU(),
-        nn.Dropout(0.5),
-        nn.Linear(512, num_classes)
-    )
-
-    model.load_state_dict(torch.load(weights_path, map_location=map_location))
-    model.to(map_location)
-    model.eval()
-
-    print(model)
-
-    return model
-
-
-def grad_cam(model, image, layer_name):
-    model.eval()
-    gradients = []
-    activations = []
-
-    def hook_function(module, grad_in, grad_out):
-        gradients.append(grad_out[0])
-
-    def forward_hook_function(module, inp, out):
-        activations.append(out)
-
-    layer = dict([*model.named_modules()])[layer_name]
-    forward_hook = layer.register_forward_hook(forward_hook_function)
-    backward_hook = layer.register_backward_hook(hook_function)
-
-    output = model(image)
-    class_idx = output.argmax(dim=1).item()
-    model.zero_grad()
-    output[:, class_idx].backward()
-
-    grad = gradients[0].cpu().data.numpy()[0]
-    act = activations[0].cpu().data.numpy()[0]
-
-    weights = np.mean(grad, axis=(1, 2))
-    cam = np.sum(weights[:, np.newaxis, np.newaxis] * act, axis=0)
-    cam = np.maximum(cam, 0)
-    cam = cv2.resize(cam, (image.shape[-1], image.shape[-2]))
-    cam = cam - np.min(cam)
-    cam = cam / np.max(cam)
-
-    forward_hook.remove()
-    backward_hook.remove()
-
-    return cam
-
-
-def superimpose_heatmap(img_path, heatmap, alpha=0.4):
-    img = cv2.imread(img_path)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    heatmap = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
-    heatmap = np.uint8(255 * heatmap)
-    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-    superimposed_img = cv2.addWeighted(img, 1 - alpha, heatmap, alpha, 0)
-    return superimposed_img
-
-
-def visualize_grad_cam(model, img_path, preprocess_fn, target_layer='_conv_head'):
-    img = cv2.imread(img_path)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    transform = preprocess_fn
-    img_tensor = transform(img).unsqueeze(0)
-
-    heatmap = grad_cam(model, img_tensor, target_layer)
-    superimposed_img = superimpose_heatmap(img_path, heatmap)
-
-    plt.figure(figsize=(10, 5))
-    plt.subplot(1, 2, 1)
-    plt.imshow(img)
-    plt.axis('off')
-    plt.title("Immagine originale")
-
-    plt.subplot(1, 2, 2)
-    plt.imshow(superimposed_img)
-    plt.axis('off')
-    plt.title("Grad-CAM Overlay")
-    plt.show()
-
-
-def overlay_grad_cam(heatmap, original_image, alpha=0.4):
-    heatmap = cv2.resize(heatmap, (original_image.shape[1], original_image.shape[0]))
-    heatmap = np.uint8(255 * heatmap)
-    heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-
-    if original_image.shape[-1] == 4:
-        alpha_channel = np.ones_like(heatmap_color[..., 0]) * 255
-        heatmap_color = np.dstack([heatmap_color, alpha_channel])
-    elif original_image.shape[-1] == 3 and heatmap_color.shape[-1] == 4:
-        heatmap_color = heatmap[..., :3]
-
-    overlay = cv2.addWeighted(original_image, 1 - alpha, heatmap_color, alpha, 0)
-    return overlay
+    return prediction
