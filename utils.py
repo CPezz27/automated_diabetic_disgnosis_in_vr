@@ -18,6 +18,7 @@ from torchvision import transforms
 import torch.nn as nn
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from efficientnet_pytorch import EfficientNet
+from imblearn.over_sampling import SMOTE
 
 
 def augmentations():
@@ -38,7 +39,7 @@ def get_transforms():
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.RandomRotation(45),
-        transforms.Grayscale(num_output_channels=3), #check
+        transforms.Grayscale(num_output_channels=3),
         transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.2),
         transforms.RandomAffine(degrees=0, translate=(0.2, 0.2)),
         transforms.ToTensor(),
@@ -47,14 +48,14 @@ def get_transforms():
 
 
 class FundusDataset(Dataset):
-    def __init__(self, data, image_dir, tabular_features, transform=None, num_augmentations=5):
+    def __init__(self, data, image_dir, tabular_data, transform=None):
         self.data = data
         self.image_dir = image_dir
-        self.tabular_features = tabular_features
+        self.tabular_data = tabular_data
         self.transform = transform
-        self.num_augmentations = num_augmentations
 
-        self.images, self.tabular_data = self.load_and_augment_data()
+    def __len__(self):
+        return len(self.data)
 
     def load_and_augment_data(self):
         images = []
@@ -63,17 +64,23 @@ class FundusDataset(Dataset):
         for idx, row in self.data.iterrows():
             img_path = os.path.join(self.image_dir, row['Image name'] + '.jpg')
             image = cv2.imread(img_path)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            image = cv2.resize(image, (128, 128))
-            tab_data = self.tabular_features[idx]
+            if image is None:
+                raise ValueError(f"Impossibile leggere l'immagine: {img_path}")
+            else:
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                image = cv2.resize(image, (128, 128))
+                tab_data = self.tabular_features[idx]
 
             images.append(image)
             tabular_data.append(tab_data)
 
-        return cls_augmented_data(images, tabular_data, self.num_augmentations)
+        augmented_images, augmented_tabular = cls_augmented_data(images, tabular_data, self.num_augmentations)
 
-    def __len__(self):
-        return len(self.images)
+        all_images = images + augmented_images
+        all_tabular = tabular_data + augmented_tabular
+
+        return all_images, all_tabular
+
 
     def __getitem__(self, idx):
         image = self.images[idx]
@@ -87,42 +94,43 @@ class FundusDataset(Dataset):
             else:
                 image = transforms.functional.to_tensor(image)
 
-        image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        image = image.clone().detach().permute(2, 0, 1).to(dtype=torch.float32) / 255.0
         tabular_data = torch.tensor(tabular_data, dtype=torch.float32)
-        label = torch.tensor(self.data.iloc[idx]['Retinopathy grade'], dtype=torch.long)
 
+        label = torch.tensor(self.data.iloc[idx]['Retinopathy grade'], dtype=torch.long)
         return image, tabular_data, label
 
 
 class MultiModalModel(nn.Module):
     def __init__(self, num_tabular_features, num_classes=5):
         super(MultiModalModel, self).__init__()
-        self.cnn = EfficientNet.from_pretrained('efficientnet-b4')
-        self.cnn._fc = nn.Linear(self.cnn._fc.in_features, 512)
+        self.cnn = EfficientNet.from_pretrained('efficientnet-b0')
+        self.cnn._fc = nn.Linear(self.cnn._fc.in_features, 256)
 
         self.mlp = nn.Sequential(
-            nn.Linear(num_tabular_features, 128),
+            nn.Linear(num_tabular_features, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU()
+            nn.Dropout(0.7),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.7),
         )
 
         self.classifier = nn.Sequential(
-            nn.Linear(512 + 64, 256),
+            nn.Linear(256 + 128, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes)
+            nn.Dropout(0.7),
+            nn.Linear(128, num_classes)
         )
 
     def forward(self, image, tabular_data):
         img_features = self.cnn(image)
-
         tab_features = self.mlp(tabular_data)
-
         combined = torch.cat((img_features, tab_features), dim=1)
-
         output = self.classifier(combined)
-
         return output
 
 
@@ -366,39 +374,63 @@ def classification_model(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = pd.read_csv(csv_path)
+
+    data['Image name'] = data['Image name'].astype(str)
+    augmented_names = pd.Series("aug_" + data.index.astype(str))
+    data['Image name'] = data['Image name'].fillna(augmented_names)
+
     label_encoder = LabelEncoder()
     data['Retinopathy grade'] = label_encoder.fit_transform(data['Retinopathy grade'])
+
     tabular_features = data.drop(columns=['Retinopathy grade', 'Image name', 'Unnamed: 11'])
     tabular_features = tabular_features.dropna(axis=1, how='all')
+    column_names = tabular_features.columns
 
     scaler = StandardScaler()
     tabular_features = scaler.fit_transform(tabular_features)
 
-    train_data, val_data = train_test_split(data, test_size=0.2, random_state=42, shuffle=True)
+    smote = SMOTE(random_state=42)
+    x_resampled, y_resampled = smote.fit_resample(tabular_features, data['Retinopathy grade'])
+
+    train_data_resampled = pd.DataFrame(x_resampled, columns=column_names)
+    train_data_resampled['Retinopathy grade'] = y_resampled
+    train_data_resampled['Image name'] = data['Image name'].iloc[:len(y_resampled)]
+
+    print(train_data_resampled['Image name'])
+
+    train_data, val_data = train_test_split(train_data_resampled, test_size=0.2, random_state=42, shuffle=True)
+
+    nan_indices = train_data['Image name'].isna()
+    count = 1
+    for idx in train_data[nan_indices].index:
+        train_data.at[idx, 'Image name'] = f'IDRiD_{count}_aug'
+        count += 1
+
+    nan_indices = val_data['Image name'].isna()
+    for idx in val_data[nan_indices].index:
+        val_data.at[idx, 'Image name'] = f'IDRiD_{count}_aug'
+        count += 1
 
     class_counts = train_data['Retinopathy grade'].value_counts().sort_index().values
-    class_weights = 1. / class_counts+1e-6
+    class_weights = 1. / class_counts
     sample_weights = class_weights[train_data['Retinopathy grade'].values]
 
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
     transform = get_transforms()
 
-    train_dataset = FundusDataset(train_data, image_dir, tabular_features, transform=transform)
+    train_dataset = FundusDataset(train_data, image_dir, x_resampled, transform=transform)
     val_dataset = FundusDataset(val_data, image_dir, tabular_features, transform=transform)
-
-    print("train_dataset len", len(train_dataset))
-    print("val_dataset len", len(val_dataset))
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, shuffle=False)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     model = MultiModalModel(num_tabular_features=tabular_features.shape[1]).to(device)
     criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32).to(device))
-    optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-2)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 
     best_val_loss = float('inf')
-    patience, counter = 10, 10
+    patience, counter = 10, 0
 
     for epoch in range(num_epochs):
         model.train()
@@ -441,7 +473,7 @@ def classification_model(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), "best_classification_model.pth")
+            torch.save(model.state_dict(), "saved_models/classification/best_classification_model.pth")
             counter = 0
         else:
             counter += 1
@@ -457,7 +489,7 @@ def classification_model(
               f"Val Precision: {val_precision / len(val_loader):.4f}, Val Recall: {val_recall / len(val_loader):.4f}, "
               f"Val F1: {val_f1 / len(val_loader):.4f}")
 
-    torch.save(model, "saved_models/efficientnet_fundus_classification.pth")
+    torch.save(model, "saved_models/classification/efficientnet_fundus_classification.pth")
 
 
 def predict_segmentation(lesion_mapping, image_dir='dataset/IDRiD/test/images', mask_dir='dataset/IDRiD/test/masks',
