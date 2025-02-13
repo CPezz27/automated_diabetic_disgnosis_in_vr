@@ -1,13 +1,18 @@
-from utils import *
+from utils_classification import *
 
-num_epochs = 30
+num_epochs = 100
 batch_size = 8
-lesion_mapping = {"MA": 1, "HE": 2, "EX": 3, "SE": 4, "OD": 5}
 
-# segmentation_model(batch_size, num_epochs)
-classification_model(batch_size, num_epochs)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# predict_segmentation(lesion_mapping)
-#result = predict_classification('dataset/IDRiD/DiseaseGrading/OriginalImages/b. Testing Set/IDRiD_006.jpg',
-#                                'dataset/IDRiD/DiseaseGrading/Groundtruths/b. IDRiD_Disease Grading_Testing Labels.csv')
-#print(f'Predicted class: {result}')
+# cls_model(batch_size, num_epochs)
+
+feature_extractor = models.efficientnet_b0(pretrained=False)
+feature_extractor.classifier = nn.Identity()
+feature_extractor.load_state_dict(torch.load("saved_models/feature_extractor.pth", map_location=device))
+feature_extractor.to(device)
+feature_extractor.eval()
+
+image_path = "dataset/IDRiD/DiseaseGrading/OriginalImages/b. Testing Set/IDRiD_001.jpg"
+
+show_gradcam(feature_extractor, image_path, device=device)
