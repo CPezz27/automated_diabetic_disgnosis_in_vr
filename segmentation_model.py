@@ -1,95 +1,100 @@
+import os
+import time
+import numpy as np
 import torch
 import torch.nn as nn
 
 
-class AttentionBlock(nn.Module):
-    def __init__(self, in_channels, gate_channels):
-        super(AttentionBlock, self).__init__()
-        self.conv_theta = nn.Conv2d(in_channels, gate_channels, kernel_size=1)
-        self.conv_phi = nn.Conv2d(gate_channels, gate_channels, kernel_size=1)
-        self.conv_psi = nn.Conv2d(gate_channels, 1, kernel_size=1)
-        self.relu = nn.ReLU(inplace=True)
-        self.sigmoid = nn.Sigmoid()
+class conv_block(nn.Module):
+    def __init__(self, in_c, out_c):
+        super().__init__()
 
-    def forward(self, x, g):
-        theta = self.conv_theta(x)
-        phi = self.conv_phi(g)
-        psi = self.relu(theta + phi)
-        psi = self.conv_psi(psi)
-        attention_map = self.sigmoid(psi)
-        return x * attention_map
+        self.conv1 = nn.Conv2d(in_c, out_c, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_c)
+
+        self.conv2 = nn.Conv2d(out_c, out_c, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_c)
+
+        self.relu = nn.ReLU()
+
+    def forward(self, inputs):
+        x = self.conv1(inputs)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+
+        return x
 
 
-class UNetWithAttention(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1, init_features=32):
-        super(UNetWithAttention, self).__init__()
-        features = init_features
+class encoder_block(nn.Module):
+    def __init__(self, in_c, out_c):
+        super().__init__()
 
-        self.encoder1 = self._block(in_channels, features, name="enc1")
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.encoder2 = self._block(features, features * 2, name="enc2")
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.encoder3 = self._block(features * 2, features * 4, name="enc3")
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.encoder4 = self._block(features * 4, features * 8, name="enc4")
-        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv = conv_block(in_c, out_c)
+        self.pool = nn.MaxPool2d((2, 2))
 
-        self.bottleneck = self._block(features * 8, features * 16, name="bottleneck")
+    def forward(self, inputs):
+        x = self.conv(inputs)
+        p = self.pool(x)
 
-        self.upconv4 = nn.ConvTranspose2d(features * 16, features * 8, kernel_size=2, stride=2)
-        self.attention4 = AttentionBlock(features * 8, features * 8)
-        self.decoder4 = self._block(features * 16, features * 8, name="dec4")
+        return x, p
 
-        self.upconv3 = nn.ConvTranspose2d(features * 8, features * 4, kernel_size=2, stride=2)
-        self.attention3 = AttentionBlock(features * 4, features * 4)
-        self.decoder3 = self._block(features * 8, features * 4, name="dec3")
 
-        self.upconv2 = nn.ConvTranspose2d(features * 4, features * 2, kernel_size=2, stride=2)
-        self.attention2 = AttentionBlock(features * 2, features * 2)
-        self.decoder2 = self._block(features * 4, features * 2, name="dec2")
+class decoder_block(nn.Module):
+    def __init__(self, in_c, out_c):
+        super().__init__()
 
-        self.upconv1 = nn.ConvTranspose2d(features * 2, features, kernel_size=2, stride=2)
-        self.attention1 = AttentionBlock(features, features)
-        self.decoder1 = self._block(features * 2, features, name="dec1")
+        self.up = nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2)
+        self.conv = conv_block(out_c * 2, out_c)
 
-        self.conv = nn.Conv2d(features, out_channels, kernel_size=1)
+    def forward(self, inputs, skip):
+        x = self.up(inputs)
 
-    def _block(self, in_channels, features, name):
-        return nn.Sequential(
-            nn.Conv2d(in_channels, features, kernel_size=3, padding=1),
-            nn.BatchNorm2d(features),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(features, features, kernel_size=3, padding=1),
-            nn.BatchNorm2d(features),
-            nn.ReLU(inplace=True),
-        )
+        if x.size()[2:] != skip.size()[2:]:
+            diffY = skip.size()[2] - x.size()[2]
+            diffX = skip.size()[3] - x.size()[3]
 
-    def forward(self, x):
-        enc1 = self.encoder1(x)
-        enc2 = self.encoder2(self.pool1(enc1))
-        enc3 = self.encoder3(self.pool2(enc2))
-        enc4 = self.encoder4(self.pool3(enc3))
+            skip = skip[:, :, :-diffY, :-diffX]
 
-        bottleneck = self.bottleneck(self.pool4(enc4))
+        x = torch.cat([x, skip], axis=1)
+        x = self.conv(x)
 
-        dec4 = self.upconv4(bottleneck)
-        att4 = self.attention4(enc4, dec4)
-        dec4 = torch.cat((att4, dec4), dim=1)
-        dec4 = self.decoder4(dec4)
+        return x
 
-        dec3 = self.upconv3(dec4)
-        att3 = self.attention3(enc3, dec3)
-        dec3 = torch.cat((att3, dec3), dim=1)
-        dec3 = self.decoder3(dec3)
 
-        dec2 = self.upconv2(dec3)
-        att2 = self.attention2(enc2, dec2)
-        dec2 = torch.cat((att2, dec2), dim=1)
-        dec2 = self.decoder2(dec2)
+class UNet(nn.Module):
+    def __init__(self):
+        super().__init__()
 
-        dec1 = self.upconv1(dec2)
-        att1 = self.attention1(enc1, dec1)
-        dec1 = torch.cat((att1, dec1), dim=1)
-        dec1 = self.decoder1(dec1)
+        self.e1 = encoder_block(1, 64)
+        self.e2 = encoder_block(64, 128)
+        self.e3 = encoder_block(128, 256)
+        self.e4 = encoder_block(256, 512)
 
-        return torch.sigmoid(self.conv(dec1))
+        self.b = conv_block(512, 1024)
+
+        self.d1 = decoder_block(1024, 512)
+        self.d2 = decoder_block(512, 256)
+        self.d3 = decoder_block(256, 128)
+        self.d4 = decoder_block(128, 64)
+
+        self.outputs = nn.Conv2d(64, 1, kernel_size=1)
+
+    def forward(self, inputs):
+        s1, p1 = self.e1(inputs)
+        s2, p2 = self.e2(p1)
+        s3, p3 = self.e3(p2)
+        s4, p4 = self.e4(p3)
+
+        b = self.b(p4)
+
+        d1 = self.d1(b, s4)
+        d2 = self.d2(d1, s3)
+        d3 = self.d3(d2, s2)
+        d4 = self.d4(d3, s1)
+
+        outputs = self.outputs(d4)
+        return outputs

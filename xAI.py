@@ -1,4 +1,4 @@
-from utils import *
+from utils_segmentations import *
 
 model = torch.load('saved_models/efficientnet_fundus_classification.pth', map_location=torch.device('cpu'))
 model.eval()
