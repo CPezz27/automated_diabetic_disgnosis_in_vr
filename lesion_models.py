@@ -5,14 +5,13 @@ num_epochs = 100
 batch_size = 8
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+'''
 model = load_best_model()
 
-image_path = "dataset/IDRiD/DiseaseGrading/OriginalImages/b. Testing Set/IDRiD_074.jpg"
+image_path = "dataset/IDRiD/DiseaseGrading/OriginalImages/b. Testing Set/IDRiD_011.jpg"
+'''
 
-show_gradcam(model, image_path)
-
-
+cls_model(batch_size, num_epochs)
 '''
 segmentation_model(lesion_type='MA')
 segmentation_model(lesion_type='OD')

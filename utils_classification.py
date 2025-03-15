@@ -3,20 +3,21 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torchvision import models, transforms
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import precision_score, recall_score, f1_score
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+from torchvision import models, transforms
+from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 
 def get_effnet_target_layer(model):
-    return model.features[-1]
+    return model.features[-2]
 
 
 class IDRiDDataset(Dataset):
@@ -28,7 +29,6 @@ class IDRiDDataset(Dataset):
         self.images = self.data['Image name'].tolist()
         self.labels = self.data['Retinopathy grade'].tolist()
 
-        # Encoding delle label in 0..4
         self.le = LabelEncoder()
         self.labels = self.le.fit_transform(self.labels)
 
@@ -49,11 +49,11 @@ class IDRiDDataset(Dataset):
 
 
 train_transform = transforms.Compose([
-    transforms.Resize((128, 128)),
+    transforms.Resize((300, 300)), #qua
     transforms.ToTensor(),
     transforms.RandomHorizontalFlip(),
     transforms.RandomVerticalFlip(),
-    transforms.RandomRotation(45),
+    transforms.RandomRotation(15),
     transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.2),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225])
@@ -61,7 +61,7 @@ train_transform = transforms.Compose([
 
 
 val_transform = transforms.Compose([
-    transforms.Resize((128, 128)),
+    transforms.Resize((300, 300)), #qua2
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406],
                          [0.229, 0.224, 0.225])
@@ -81,9 +81,17 @@ def extract_image_features(image_path, model, transform):
 
 
 def get_effnet5(pretrained=True):
-    model = models.efficientnet_b0(pretrained=pretrained)
+    model = models.efficientnet_b3(pretrained=pretrained)
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    for param in list(model.features[-3:].parameters()):
+        param.requires_grad = True
+
     num_ftrs = model.classifier[1].in_features
     model.classifier[1] = nn.Linear(num_ftrs, 5)
+
     return model
 
 
@@ -118,12 +126,18 @@ def cls_model(batch_size, num_epochs, image_dir='dataset/IDRiD/DiseaseGrading/Or
     model = get_effnet5(pretrained=True)
     model = model.to(device)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-2)
+    class_counts = np.bincount(y_encoded)
+    class_weights = torch.tensor(1.0 / class_counts, dtype=torch.float32)
+
+    class_weights = class_weights / class_weights.sum()
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+    optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
 
     best_val_loss = float('inf')
-    patience = 10
+    early_patience = 10
     counter = 0
+
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3, verbose=True)
 
     for epoch in range(num_epochs):
         model.train()
@@ -185,6 +199,8 @@ def cls_model(batch_size, num_epochs, image_dir='dataset/IDRiD/DiseaseGrading/Or
         recall_val = recall_score(all_labels_val, all_preds_val, average='macro', zero_division=0)
         f1_val = f1_score(all_labels_val, all_preds_val, average='macro', zero_division=0)
 
+        scheduler.step(val_loss)
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             counter = 0
@@ -192,7 +208,7 @@ def cls_model(batch_size, num_epochs, image_dir='dataset/IDRiD/DiseaseGrading/Or
             print("Miglior modello salvato!")
         else:
             counter += 1
-            if counter >= patience:
+            if counter >= early_patience:
                 print("Early stopping attivato!")
                 break
 
@@ -224,7 +240,7 @@ def show_gradcam(model, image_path, target_class=None, device=None):
     model.eval()
 
     test_transform = transforms.Compose([
-        transforms.Resize((128, 128)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])

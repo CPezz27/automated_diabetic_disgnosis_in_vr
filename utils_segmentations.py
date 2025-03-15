@@ -165,27 +165,3 @@ def segmentation_model(lesion_type):
 
         return output
 
-    test_image_path = test_images[0]
-    actual_mask_path = test_masks[0]
-
-    '''predicted_mask = predict(model, test_image_path)
-
-    actual_mask = Image.open(actual_mask_path).convert("L")
-    actual_mask = actual_mask.resize((256, 256))
-    actual_mask = transforms.ToTensor()(actual_mask).squeeze().numpy()
-
-    fig, ax = plt.subplots(1, 3, figsize=(12, 4))
-
-    ax[0].imshow(Image.open(test_image_path), cmap="jet")
-    ax[0].set_title("Test Image")
-    ax[0].axis("off")
-
-    ax[1].imshow(actual_mask, cmap="gray")
-    ax[1].set_title("Ground Truth Mask")
-    ax[1].axis("off")
-
-    ax[2].imshow(predicted_mask, cmap="gray")
-    ax[2].set_title("Predicted Segmentation Mask")
-    ax[2].axis("off")
-
-    plt.show()'''
