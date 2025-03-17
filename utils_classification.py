@@ -17,7 +17,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score
 
 
 def get_effnet_target_layer(model):
-    return model.features[-2]
+    return model.features[-3]
 
 
 class IDRiDDataset(Dataset):
@@ -288,20 +288,31 @@ def show_gradcam(model, image_path, target_class=None, device=None):
     act = activations['value']
     grad = gradients['value']
 
-    weights = grad.mean(dim=(2, 3), keepdim=True)
+    weights = grad.mean(dim=(2, 3), keepdim=True) / (grad.std(dim=(2, 3), keepdim=True) + 1e-8)
     cam = (weights * act).sum(dim=1)
     cam = F.relu(cam)
 
+    cam = (cam - cam.mean()) / (cam.std() + 1e-8)
     cam = cam - cam.min()
     cam = cam / (cam.max() + 1e-8)
-    cam = cam.cpu().numpy()[0]
 
-    cam_resized = cv2.resize(cam, original_image.size)
+    # I encountered an error due to the cam format passed to resize. I therefore also added this part of code
+
+    cam_np = cam.squeeze().cpu().numpy()
+    width, height = original_image.size
+    cam_resized = cv2.resize(cam_np, (width, height))
+
+    # cam_resized = cv2.resize(cam, original_image.size)
+
     heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
 
     original_image_np = np.array(original_image)
-    superimposed_img = heatmap * 0.4 + original_image_np * 0.6
+
+    print("original_image_np shape:", original_image_np.shape)
+    print("heatmap shape:", heatmap.shape)
+
+    superimposed_img = cv2.addWeighted(original_image_np, 0.6, heatmap, 0.4, 0)
     superimposed_img = np.clip(superimposed_img, 0, 255).astype(np.uint8)
 
     fwd_handle.remove()
