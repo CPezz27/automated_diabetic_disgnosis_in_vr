@@ -8,7 +8,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = load_best_model()
 
-image_path = "dataset/IDRiD/DiseaseGrading/OriginalImages/b. Testing Set/IDRiD_014.jpg"
+image_path = "dataset/IDRiD/DiseaseGrading/OriginalImages/b. Testing Set/IDRiD_011.jpg"
 
 show_gradcam(model, image_path)
 

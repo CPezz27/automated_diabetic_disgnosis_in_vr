@@ -49,7 +49,7 @@ class IDRiDDataset(Dataset):
 
 
 train_transform = transforms.Compose([
-    transforms.Resize((300, 300)), #qua
+    transforms.Resize((300, 300)),
     transforms.ToTensor(),
     transforms.RandomHorizontalFlip(),
     transforms.RandomVerticalFlip(),
@@ -61,7 +61,7 @@ train_transform = transforms.Compose([
 
 
 val_transform = transforms.Compose([
-    transforms.Resize((300, 300)), #qua2
+    transforms.Resize((300, 300)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406],
                          [0.229, 0.224, 0.225])
@@ -72,7 +72,7 @@ def extract_image_features(image_path, model, transform):
     try:
         image = Image.open(image_path).convert('RGB')
     except Exception as e:
-        print(f"Errore nell'aprire l'immagine {image_path}: {e}")
+        print(f"Error in opening the image {image_path}: {e}")
         return None
     image = transform(image).unsqueeze(0).to(next(model.parameters()).device)
     with torch.no_grad():
@@ -205,7 +205,7 @@ def cls_model(batch_size, num_epochs, image_dir='dataset/IDRiD/DiseaseGrading/Or
             best_val_loss = val_loss
             counter = 0
             torch.save(model.state_dict(), "saved_models/classification/classifier_best.pth")
-            print("Miglior modello salvato!")
+            print("Best model saved!")
         else:
             counter += 1
             if counter >= early_patience:
@@ -275,11 +275,11 @@ def show_gradcam(model, image_path, target_class=None, device=None):
 
     if target_class is None:
         target_class = output.argmax(dim=1).item()
-        print(f"Target class selezionata: {target_class} - {class_names.get(target_class, 'Unknown')}")
+        print(f"Target class selected: {target_class} - {class_names.get(target_class, 'Unknown')}")
     else:
         if target_class not in class_names:
-            raise ValueError(f"La target_class deve essere tra 0 e 4, trovato {target_class}")
-        print(f"Target class fornita: {target_class} - {class_names[target_class]}")
+            raise ValueError(f"The value of target_class must be between 0 and 4, found: {target_class}")
+        print(f"Target class provided: {target_class} - {class_names[target_class]}")
 
     score = output[0, target_class]
     model.zero_grad()
@@ -302,15 +302,10 @@ def show_gradcam(model, image_path, target_class=None, device=None):
     width, height = original_image.size
     cam_resized = cv2.resize(cam_np, (width, height))
 
-    # cam_resized = cv2.resize(cam, original_image.size)
-
     heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
 
     original_image_np = np.array(original_image)
-
-    print("original_image_np shape:", original_image_np.shape)
-    print("heatmap shape:", heatmap.shape)
 
     superimposed_img = cv2.addWeighted(original_image_np, 0.6, heatmap, 0.4, 0)
     superimposed_img = np.clip(superimposed_img, 0, 255).astype(np.uint8)
